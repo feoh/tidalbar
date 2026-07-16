@@ -188,19 +188,19 @@ impl App {
                 Action::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_shelf(1);
-                Action::None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_shelf(-1);
-                Action::None
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
                 self.move_item(1);
                 Action::None
             }
-            KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.move_item(-1);
+                Action::None
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.move_shelf(1);
+                Action::None
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.move_shelf(-1);
                 Action::None
             }
             KeyCode::Enter | KeyCode::Char('p') => self.play_selected(),
@@ -344,10 +344,10 @@ mod tests {
     fn navigation_wraps_between_shelves_and_items() {
         let mut app = App::new(false);
 
-        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Left));
         assert_eq!(app.selected_shelf, app.shelves.len() - 1);
 
-        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Up));
         assert_eq!(
             app.selected_item,
             app.shelves.last().expect("demo shelf").items.len() - 1

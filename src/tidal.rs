@@ -90,6 +90,22 @@ impl TidalClient {
         .await
     }
 
+    pub async fn track_radio(&self, track_id: &str) -> Result<Vec<MediaItem>, TidalError> {
+        self.relationship_items(
+            &["tracks", track_id, "relationships", "radio"],
+            "radio,radio.artists,radio.albums,radio.albums.coverArt",
+        )
+        .await
+    }
+
+    pub async fn similar_tracks(&self, track_id: &str) -> Result<Vec<MediaItem>, TidalError> {
+        self.relationship_items(
+            &["tracks", track_id, "relationships", "similarTracks"],
+            "similarTracks,similarTracks.artists,similarTracks.albums,similarTracks.albums.coverArt",
+        )
+        .await
+    }
+
     pub async fn collection_tracks(&self) -> Result<Vec<MediaItem>, TidalError> {
         let document = self
             .get(

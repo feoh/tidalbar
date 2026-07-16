@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
     } else if let Some(warning) = token_warning {
         app.status = warning;
     } else if let Some(client) = tidal.as_ref() {
-        match load_screen(client, Screen::ForYou).await {
+        match load_screen(client, Screen::ForYou, None).await {
             Ok(shelves) => app.replace_shelves(shelves),
             Err(error) => app.playback_failed(format!("Could not load For You: {error}")),
         }
@@ -309,7 +309,7 @@ async fn run_app(
             }
             Action::Load(screen) => {
                 if let Some(client) = tidal {
-                    match load_screen(client, screen).await {
+                    match load_screen(client, screen, app.now_playing.as_ref()).await {
                         Ok(shelves) => app.replace_shelves(shelves),
                         Err(error) => app.playback_failed(error.to_string()),
                     }
@@ -381,7 +381,11 @@ async fn run_app(
     Ok(())
 }
 
-async fn load_screen(client: &TidalClient, screen: Screen) -> Result<Vec<Shelf>> {
+async fn load_screen(
+    client: &TidalClient,
+    screen: Screen,
+    now_playing: Option<&MediaItem>,
+) -> Result<Vec<Shelf>> {
     match screen {
         Screen::ForYou => {
             let (daily, discovery, new_releases) = tokio::join!(
@@ -427,7 +431,16 @@ async fn load_screen(client: &TidalClient, screen: Screen) -> Result<Vec<Shelf>>
             "Your playlists",
             client.collection_playlists().await?,
         )]),
-        Screen::Explore => Ok(vec![Shelf::new("Explore", Vec::new())]),
+        Screen::Explore => match now_playing.filter(|item| item.kind == MediaKind::Track) {
+            Some(track) => {
+                let (radio, similar) = tokio::join!(
+                    client.track_radio(&track.id),
+                    client.similar_tracks(&track.id)
+                );
+                shelves_from_results([("Track radio", radio), ("Similar tracks", similar)])
+            }
+            None => Ok(Vec::new()),
+        },
     }
 }
 

@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, symbols};
 
 use crate::app::{App, Focus, Screen};
@@ -121,56 +121,75 @@ fn render_content(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_shelves(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.shelves.is_empty() {
-        render_empty(frame, area, "For You", "No recommendations are available.");
+        let message = match app.screen {
+            Screen::Explore => {
+                "Play a track, then reopen Explore to see its radio and similar tracks."
+            }
+            _ => "No recommendations are available.",
+        };
+        render_empty(frame, area, app.screen.label(), message);
         return;
     }
 
-    let visible = usize::min(app.shelves.len(), usize::from(area.height / 4).max(1));
-    let constraints = vec![Constraint::Length(4); visible];
+    let constraints = app
+        .shelves
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            if index == app.selected_shelf {
+                Constraint::Min(3)
+            } else {
+                Constraint::Length(1)
+            }
+        })
+        .collect::<Vec<_>>();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
 
-    let first = app.selected_shelf.saturating_sub(visible.saturating_sub(1));
-    for (row, shelf_index) in rows.iter().zip(first..app.shelves.len()) {
-        let Some(shelf) = app.shelves.get(shelf_index) else {
-            break;
-        };
+    for (row, (shelf_index, shelf)) in rows.iter().zip(app.shelves.iter().enumerate()) {
         let selected_shelf = shelf_index == app.selected_shelf;
-        let mut title_style = Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-        if selected_shelf {
-            title_style = title_style.fg(ACCENT);
+        let title_style = if selected_shelf {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+
+        if !selected_shelf {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!(" {} ({})", shelf.title, shelf.items.len()),
+                    title_style,
+                )),
+                *row,
+            );
+            continue;
         }
 
-        let mut item_spans = Vec::new();
-        for (item_index, item) in shelf.items.iter().enumerate() {
-            let selected = selected_shelf && item_index == app.selected_item;
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White).bg(PANEL)
-            };
-            item_spans.push(Span::styled(
-                format!(" {} · {} ", item.title, item.subtitle),
-                style,
-            ));
-            item_spans.push(Span::raw(" "));
-        }
-
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(*row);
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(format!(" {}", shelf.title), title_style),
-                Line::from(item_spans),
-            ])
-            .wrap(Wrap { trim: true }),
-            *row,
+            Paragraph::new(Line::styled(format!(" {}", shelf.title), title_style)),
+            sections[0],
         );
+
+        let items: Vec<ListItem> = shelf
+            .items
+            .iter()
+            .map(|item| ListItem::new(format!(" {} · {}", item.title, item.subtitle)))
+            .collect();
+        let list = List::new(items).highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        );
+        let mut state = ListState::default();
+        state.select(Some(app.selected_item));
+        frame.render_stateful_widget(list, sections[1], &mut state);
     }
 }
 
@@ -349,8 +368,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Line::from("  Tab / Shift-Tab   Move between sidebar and content"),
-        Line::from("  ↑ ↓ or j k        Choose sidebar view / shelf"),
-        Line::from("  ← → or h l        Choose item; → enters content"),
+        Line::from("  ↑ ↓ or j k        Sidebar: choose view · Content: choose track"),
+        Line::from("  ← → or h l        Sidebar: enter content · Content: switch shelf"),
         Line::from("  Enter / p         Open selection or play track preview"),
         Line::from("  Backspace / Esc   Return from a detail view"),
         Line::default(),
