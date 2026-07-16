@@ -48,7 +48,7 @@ impl TidalClient {
                 &["searchResults", query],
                 &[(
                     "include",
-                    "topHits,tracks,tracks.artists,tracks.albums,tracks.albums.coverArt,albums,albums.artists,albums.coverArt,artists,artists.profileArt,playlists,playlists.coverArt",
+                    "topHits,tracks,tracks.artists,albums,albums.artists,albums.coverArt,artists,artists.profileArt,playlists,playlists.coverArt",
                 )],
             )
             .await?;
@@ -159,7 +159,7 @@ impl TidalClient {
     }
 
     async fn mix_items(&self, resource: &str) -> Result<Vec<MediaItem>, TidalError> {
-        let document = self
+        let document = match self
             .get(
                 &[resource, "me"],
                 &[(
@@ -167,7 +167,14 @@ impl TidalClient {
                     "items,items.artists,items.albums,items.coverArt,items.profileArt",
                 )],
             )
-            .await?;
+            .await
+        {
+            Ok(document) => document,
+            Err(TidalError::Api { status, .. }) if status == StatusCode::NOT_FOUND => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
         Ok(items_from_document(&document, Some(&["items"])))
     }
 
@@ -190,14 +197,8 @@ impl TidalClient {
             .send()
             .await?;
         let status = response.status();
-        let document: Value = response.json().await?;
-        if !status.is_success() {
-            return Err(TidalError::Api {
-                status,
-                detail: api_error_detail(&document),
-            });
-        }
-        Ok(document)
+        let bytes = response.bytes().await?;
+        decode_response(status, &bytes)
     }
 }
 
@@ -354,6 +355,27 @@ fn kind_label(kind: &MediaKind) -> &'static str {
     }
 }
 
+fn decode_response(status: StatusCode, bytes: &[u8]) -> Result<Value, TidalError> {
+    let parsed = serde_json::from_slice::<Value>(bytes);
+    if !status.is_success() {
+        let detail = parsed.as_ref().map_or_else(
+            |_| {
+                status
+                    .canonical_reason()
+                    .unwrap_or("empty API error response")
+                    .to_owned()
+            },
+            api_error_detail,
+        );
+        return Err(TidalError::Api { status, detail });
+    }
+    parsed.map_err(|error| {
+        TidalError::InvalidResponse(format!(
+            "could not decode {status} response as JSON: {error}"
+        ))
+    })
+}
+
 fn api_error_detail(document: &Value) -> String {
     document
         .get("errors")
@@ -414,5 +436,26 @@ mod tests {
             json!({"errors": [{"code": "GEO_RESTRICTED", "detail": "Not available here"}]});
 
         assert_eq!(api_error_detail(&document), "Not available here");
+    }
+
+    #[test]
+    fn empty_error_response_uses_http_reason() {
+        let error = decode_response(StatusCode::NOT_FOUND, &[]).expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "TIDAL API returned 404 Not Found: Not Found"
+        );
+    }
+
+    #[test]
+    fn successful_non_json_response_is_rejected() {
+        let error = decode_response(StatusCode::OK, b"not json").expect_err("must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not decode 200 OK response")
+        );
     }
 }

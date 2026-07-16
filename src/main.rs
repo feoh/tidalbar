@@ -29,6 +29,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Test credentials and official API access without displaying user data.
+    Doctor,
     /// Inspect or update non-secret local configuration.
     Config {
         #[command(subcommand)]
@@ -114,6 +116,7 @@ async fn main() -> Result<()> {
 
 async fn run_command(command: Command) -> Result<()> {
     match command {
+        Command::Doctor => run_doctor().await?,
         Command::Config {
             action: ConfigAction::Path,
         } => {
@@ -164,6 +167,82 @@ async fn run_command(command: Command) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn run_doctor() -> Result<()> {
+    let config = AppConfig::load()?;
+    let client_id = config
+        .client_id
+        .context("public client ID is not configured")?;
+    let mut tokens = TokenStore
+        .load()?
+        .context("no OAuth authorization is stored; run `tidalbar auth login`")?;
+    if tokens.client_id != client_id {
+        return Err(anyhow!(
+            "stored authorization belongs to a different client ID"
+        ));
+    }
+    if tokens.expires_soon() {
+        tokens = refresh(&tokens).await?;
+        TokenStore.save(&tokens)?;
+    }
+    let client = TidalClient::new(tokens.access_token);
+    let mut failures = Vec::new();
+
+    let search_items = match client.search("Miles Davis").await {
+        Ok(items) => {
+            println!("✓ search: {} items", items.len());
+            items
+        }
+        Err(error) => {
+            println!("✗ search: {error}");
+            failures.push("search");
+            Vec::new()
+        }
+    };
+
+    macro_rules! check_items {
+        ($label:literal, $request:expr) => {
+            match $request.await {
+                Ok(items) => println!("✓ {}: {} items", $label, items.len()),
+                Err(error) => {
+                    println!("✗ {}: {}", $label, error);
+                    failures.push($label);
+                }
+            }
+        };
+    }
+
+    check_items!("collection tracks", client.collection_tracks());
+    check_items!("collection albums", client.collection_albums());
+    check_items!("collection artists", client.collection_artists());
+    check_items!("collection playlists", client.collection_playlists());
+    check_items!("daily mixes", client.daily_mixes());
+    check_items!("discovery mixes", client.discovery_mixes());
+    check_items!("new release mixes", client.new_release_mixes());
+
+    if let Some(track) = search_items
+        .iter()
+        .find(|item| item.kind == MediaKind::Track)
+    {
+        match client.official_preview(&track.id).await {
+            Ok(_) => println!("✓ official preview manifest"),
+            Err(tidalbar::tidal::TidalError::FullTrackDisabled) => {
+                println!("✓ playback policy rejected a full-track manifest")
+            }
+            Err(error) => {
+                println!("✗ official preview manifest: {error}");
+                failures.push("official preview manifest");
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        println!("tidalbar API diagnostics passed");
+        Ok(())
+    } else {
+        Err(anyhow!("failed checks: {}", failures.join(", ")))
+    }
 }
 
 async fn run_app(
@@ -259,10 +338,24 @@ async fn load_screen(client: &TidalClient, screen: Screen) -> Result<Vec<Shelf>>
                 client.discovery_mixes(),
                 client.new_release_mixes()
             );
-            shelves_from_results([
+            let mixes = shelves_from_results([
                 ("Daily mixes", daily),
                 ("Discovery mixes", discovery),
                 ("New releases", new_releases),
+            ])?;
+            if !mixes.is_empty() {
+                return Ok(mixes);
+            }
+
+            let (tracks, albums, playlists) = tokio::join!(
+                client.collection_tracks(),
+                client.collection_albums(),
+                client.collection_playlists()
+            );
+            shelves_from_results([
+                ("Recently liked tracks", tracks),
+                ("Recently liked albums", albums),
+                ("Your playlists", playlists),
             ])
         }
         Screen::Collection => {
@@ -292,13 +385,19 @@ fn shelves_from_results<const N: usize>(
 ) -> Result<Vec<Shelf>> {
     let mut shelves = Vec::new();
     let mut errors = Vec::new();
+    let mut successes = 0;
     for (title, result) in results {
         match result {
-            Ok(items) => shelves.push(Shelf::new(title, items)),
+            Ok(items) => {
+                successes += 1;
+                if !items.is_empty() {
+                    shelves.push(Shelf::new(title, items));
+                }
+            }
             Err(error) => errors.push(error.to_string()),
         }
     }
-    if shelves.is_empty() {
+    if successes == 0 {
         Err(anyhow!(errors.join("; ")))
     } else {
         Ok(shelves)

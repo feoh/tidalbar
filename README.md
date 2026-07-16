@@ -66,6 +66,7 @@ cargo run -- config set-client-id YOUR_PUBLIC_CLIENT_ID
 cargo run -- config set-redirect-uri http://127.0.0.1:47831/oauth/callback
 cargo run -- auth login
 cargo run -- auth status
+cargo run -- doctor
 ```
 
 ## Keybindings
