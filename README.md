@@ -31,11 +31,12 @@ The initial application shell is usable and includes:
 - Secure OAuth PKCE login, refresh, and OS credential-store persistence
 - Official search, collection, playlist, recommendation-mix, artwork, and
   preview-manifest API integration
+- Album, artist, and playlist drill-down with back navigation
 - Configuration in the platform-standard user configuration directory
 
-Placeholder content is shown when tidalbar is not authenticated. Album and
-artist drill-down, pagination, queue management, and collection mutations remain
-under active development.
+Placeholder content is shown when tidalbar is not authenticated. Pagination,
+queue management, richer recommendation shelves, and collection mutations
+remain under active development.
 
 ## Requirements
 
@@ -80,7 +81,8 @@ cargo run -- doctor
 | `/` | Search |
 | `h`/`l` or arrows | Move within a shelf |
 | `j`/`k` or arrows | Move between shelves |
-| `Enter` or `p` | Play the selected official preview |
+| `Enter` or `p` | Open albums/artists/playlists or play a track preview |
+| `Backspace` or `Esc` | Return from a detail view |
 | `Space` | Pause or resume |
 | `q` | Quit |
 

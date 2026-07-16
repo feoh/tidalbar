@@ -221,6 +221,25 @@ async fn run_doctor() -> Result<()> {
     check_items!("discovery mixes", client.discovery_mixes());
     check_items!("new release mixes", client.new_release_mixes());
 
+    if let Some(album) = search_items
+        .iter()
+        .find(|item| item.kind == MediaKind::Album)
+    {
+        check_items!("album drill-down", client.album_items(&album.id));
+    }
+    if let Some(artist) = search_items
+        .iter()
+        .find(|item| item.kind == MediaKind::Artist)
+    {
+        check_items!("artist drill-down", client.artist_tracks(&artist.id));
+    }
+    if let Some(playlist) = search_items
+        .iter()
+        .find(|item| item.kind == MediaKind::Playlist)
+    {
+        check_items!("playlist drill-down", client.playlist_items(&playlist.id));
+    }
+
     if let Some(track) = search_items
         .iter()
         .find(|item| item.kind == MediaKind::Track)
@@ -291,26 +310,47 @@ async fn run_app(
                     );
                 }
             }
-            Action::Play(item) => {
-                let resource = match resolver.resolve(&item) {
-                    Ok(resource) => Ok(resource),
-                    Err(error) if item.kind == MediaKind::Track => match tidal {
-                        Some(client) => client
-                            .official_preview(&item.id)
-                            .await
-                            .map_err(|error| error.to_string()),
-                        None => Err(error.to_string()),
-                    },
-                    Err(error) => Err(error.to_string()),
-                };
-                match resource {
-                    Ok(resource) => match player.play(&resource) {
-                        Ok(()) => app.playback_started(item),
-                        Err(error) => app.playback_failed(error.to_string()),
-                    },
-                    Err(error) => app.playback_failed(error),
+            Action::Play(item) => match item.kind {
+                MediaKind::Track => {
+                    let resource = match resolver.resolve(&item) {
+                        Ok(resource) => Ok(resource),
+                        Err(error) => match tidal {
+                            Some(client) => client
+                                .official_preview(&item.id)
+                                .await
+                                .map_err(|error| error.to_string()),
+                            None => Err(error.to_string()),
+                        },
+                    };
+                    match resource {
+                        Ok(resource) => match player.play(&resource) {
+                            Ok(()) => app.playback_started(item),
+                            Err(error) => app.playback_failed(error.to_string()),
+                        },
+                        Err(error) => app.playback_failed(error),
+                    }
                 }
-            }
+                MediaKind::Album | MediaKind::Artist | MediaKind::Playlist => {
+                    if let Some(client) = tidal {
+                        let title = item.title.clone();
+                        let items = match item.kind {
+                            MediaKind::Album => client.album_items(&item.id).await,
+                            MediaKind::Artist => client.artist_tracks(&item.id).await,
+                            MediaKind::Playlist => client.playlist_items(&item.id).await,
+                            _ => unreachable!("media kind matched above"),
+                        };
+                        match items {
+                            Ok(items) => app.open_items(title, items),
+                            Err(error) => app.playback_failed(error.to_string()),
+                        }
+                    } else {
+                        app.playback_failed("Authenticate to browse this item");
+                    }
+                }
+                MediaKind::Mix | MediaKind::Radio => {
+                    app.playback_failed("This item type is not browsable yet");
+                }
+            },
             Action::TogglePause(paused) => {
                 if let Err(error) = player.set_paused(paused) {
                     app.playback_failed(error.to_string());

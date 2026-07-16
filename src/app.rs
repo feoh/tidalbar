@@ -39,6 +39,15 @@ pub enum Action {
 }
 
 #[derive(Debug)]
+struct ViewState {
+    screen: Screen,
+    shelves: Vec<Shelf>,
+    selected_shelf: usize,
+    selected_item: usize,
+    status: String,
+}
+
+#[derive(Debug)]
 pub struct App {
     pub screen: Screen,
     pub shelves: Vec<Shelf>,
@@ -49,6 +58,7 @@ pub struct App {
     pub now_playing: Option<MediaItem>,
     pub paused: bool,
     pub status: String,
+    history: Vec<ViewState>,
 }
 
 impl App {
@@ -69,6 +79,7 @@ impl App {
             now_playing: None,
             paused: false,
             status: status.to_owned(),
+            history: Vec::new(),
         }
     }
 
@@ -98,6 +109,10 @@ impl App {
             KeyCode::Char('e') => self.switch_screen(Screen::Explore),
             KeyCode::Char('c') => self.switch_screen(Screen::Collection),
             KeyCode::Char('P') => self.switch_screen(Screen::Playlists),
+            KeyCode::Esc | KeyCode::Backspace => {
+                self.go_back();
+                Action::None
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_shelf(1);
                 Action::None
@@ -129,10 +144,25 @@ impl App {
     }
 
     pub fn replace_shelves(&mut self, shelves: Vec<Shelf>) {
+        self.history.clear();
         self.shelves = shelves;
         self.selected_shelf = 0;
         self.selected_item = 0;
         self.status = "TIDAL data loaded".to_owned();
+    }
+
+    pub fn open_items(&mut self, title: impl Into<String>, items: Vec<MediaItem>) {
+        self.history.push(ViewState {
+            screen: self.screen,
+            shelves: self.shelves.clone(),
+            selected_shelf: self.selected_shelf,
+            selected_item: self.selected_item,
+            status: self.status.clone(),
+        });
+        self.shelves = vec![Shelf::new(title, items)];
+        self.selected_shelf = 0;
+        self.selected_item = 0;
+        self.status = "Backspace returns to the previous view".to_owned();
     }
 
     pub fn playback_started(&mut self, item: MediaItem) {
@@ -143,6 +173,17 @@ impl App {
 
     pub fn playback_failed(&mut self, message: impl Into<String>) {
         self.status = message.into();
+    }
+
+    fn go_back(&mut self) {
+        let Some(previous) = self.history.pop() else {
+            return;
+        };
+        self.screen = previous.screen;
+        self.shelves = previous.shelves;
+        self.selected_shelf = previous.selected_shelf;
+        self.selected_item = previous.selected_item;
+        self.status = previous.status;
     }
 
     fn handle_search_key(&mut self, code: KeyCode) -> Action {
@@ -242,6 +283,26 @@ mod tests {
         assert!(!app.search_active);
         assert_eq!(app.search_query, "q");
         assert_eq!(action, Action::Search("q".to_owned()));
+    }
+
+    #[test]
+    fn detail_views_restore_the_previous_selection() {
+        let mut app = App::new(false);
+        app.selected_item = 2;
+        app.open_items(
+            "Album",
+            vec![MediaItem::new(
+                "track",
+                "Track",
+                "Artist",
+                crate::models::MediaKind::Track,
+            )],
+        );
+
+        app.handle_key(key(KeyCode::Backspace));
+
+        assert_eq!(app.selected_item, 2);
+        assert_eq!(app.shelves[0].title, "Custom mixes");
     }
 
     #[test]

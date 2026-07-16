@@ -210,7 +210,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let controls = if app.now_playing.is_some() {
         "Space pause/resume"
     } else {
-        "Enter play preview"
+        "Enter open/play"
     };
     let player = Paragraph::new(vec![
         Line::from(vec![

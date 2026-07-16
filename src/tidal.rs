@@ -58,6 +58,38 @@ impl TidalClient {
         ))
     }
 
+    pub async fn album_items(&self, album_id: &str) -> Result<Vec<MediaItem>, TidalError> {
+        self.relationship_items(
+            &["albums", album_id, "relationships", "items"],
+            "items,items.artists,items.albums,items.albums.coverArt",
+        )
+        .await
+    }
+
+    pub async fn artist_tracks(&self, artist_id: &str) -> Result<Vec<MediaItem>, TidalError> {
+        let document = self
+            .get(
+                &["artists", artist_id, "relationships", "tracks"],
+                &[
+                    ("collapseBy", "FINGERPRINT"),
+                    (
+                        "include",
+                        "tracks,tracks.artists,tracks.albums,tracks.albums.coverArt",
+                    ),
+                ],
+            )
+            .await?;
+        Ok(items_from_document(&document, None))
+    }
+
+    pub async fn playlist_items(&self, playlist_id: &str) -> Result<Vec<MediaItem>, TidalError> {
+        self.relationship_items(
+            &["playlists", playlist_id, "relationships", "items"],
+            "items,items.tracks:artists,items.tracks:albums,items.tracks:albums.coverArt",
+        )
+        .await
+    }
+
     pub async fn collection_tracks(&self) -> Result<Vec<MediaItem>, TidalError> {
         let document = self
             .get(
@@ -156,6 +188,15 @@ impl TidalClient {
             .await?
             .error_for_status()?;
         Ok(response.bytes().await?.to_vec())
+    }
+
+    async fn relationship_items(
+        &self,
+        segments: &[&str],
+        include: &str,
+    ) -> Result<Vec<MediaItem>, TidalError> {
+        let document = self.get(segments, &[("include", include)]).await?;
+        Ok(items_from_document(&document, None))
     }
 
     async fn mix_items(&self, resource: &str) -> Result<Vec<MediaItem>, TidalError> {
