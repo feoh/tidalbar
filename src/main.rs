@@ -185,6 +185,7 @@ async fn run_app(
             continue;
         };
 
+        let selected_before = app.selected().map(|item| item.id.clone());
         match app.handle_key(key) {
             Action::None => {}
             Action::Quit => break,
@@ -195,7 +196,6 @@ async fn run_app(
                             .replace_shelves(vec![Shelf::new(format!("Search · {query}"), items)]),
                         Err(error) => app.playback_failed(error.to_string()),
                     }
-                    update_artwork(Some(client), app.selected(), artwork.as_deref_mut()).await;
                 } else {
                     app.playback_failed("Authenticate with `tidalbar auth login` to search");
                 }
@@ -206,7 +206,6 @@ async fn run_app(
                         Ok(shelves) => app.replace_shelves(shelves),
                         Err(error) => app.playback_failed(error.to_string()),
                     }
-                    update_artwork(Some(client), app.selected(), artwork.as_deref_mut()).await;
                 } else {
                     app.playback_failed(
                         "Authenticate with `tidalbar auth login` to load TIDAL data",
@@ -238,6 +237,11 @@ async fn run_app(
                     app.playback_failed(error.to_string());
                 }
             }
+        }
+
+        let selected_after = app.selected().map(|item| item.id.clone());
+        if selected_after != selected_before {
+            update_artwork(tidal, app.selected(), artwork.as_deref_mut()).await;
         }
     }
 
