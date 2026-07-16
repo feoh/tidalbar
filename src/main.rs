@@ -286,6 +286,15 @@ async fn run_app(
         let selected_before = app.selected().map(|item| item.id.clone());
         match app.handle_key(key) {
             Action::None => {}
+            Action::FocusPlayer(focused) => {
+                let target = if focused {
+                    app.now_playing.as_ref().or_else(|| app.selected())
+                } else {
+                    app.selected()
+                }
+                .cloned();
+                update_artwork(tidal, target.as_ref(), artwork.as_deref_mut()).await;
+            }
             Action::Quit => break,
             Action::Search(query) => {
                 if let Some(client) = tidal {

@@ -74,6 +74,8 @@ cargo run -- doctor
 
 | Key | Action |
 | --- | --- |
+| `?` | Open or close keyboard help |
+| `Tab` / `Shift-Tab` | Move focus between the sidebar and content |
 | `g` | For You |
 | `e` | Explore |
 | `c` | Collection |
@@ -84,7 +86,8 @@ cargo run -- doctor
 | `Enter` or `p` | Open albums/artists/playlists or play a track preview |
 | `Backspace` or `Esc` | Return from a detail view |
 | `Space` | Pause or resume |
-| `q` | Quit |
+| `f` | Toggle the large-art player focus view |
+| `q` | Quit (or close help when help is open) |
 
 ## Configuration and secrets
 

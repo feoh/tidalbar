@@ -28,8 +28,15 @@ impl Screen {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Focus {
+    Sidebar,
+    Content,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
+    FocusPlayer(bool),
     Load(Screen),
     None,
     Play(MediaItem),
@@ -55,6 +62,9 @@ pub struct App {
     pub selected_item: usize,
     pub search_active: bool,
     pub search_query: String,
+    pub help_visible: bool,
+    pub player_focused: bool,
+    pub focus: Focus,
     pub now_playing: Option<MediaItem>,
     pub paused: bool,
     pub status: String,
@@ -76,6 +86,9 @@ impl App {
             selected_item: 0,
             search_active: false,
             search_query: String::new(),
+            help_visible: false,
+            player_focused: false,
+            focus: Focus::Content,
             now_playing: None,
             paused: false,
             status: status.to_owned(),
@@ -96,6 +109,67 @@ impl App {
 
         if self.search_active {
             return self.handle_search_key(key.code);
+        }
+
+        if self.help_visible {
+            if matches!(
+                key.code,
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')
+            ) {
+                self.help_visible = false;
+            }
+            return Action::None;
+        }
+
+        if matches!(key.code, KeyCode::Char('?')) {
+            self.help_visible = true;
+            return Action::None;
+        }
+        if matches!(key.code, KeyCode::Char('f')) {
+            self.player_focused = !self.player_focused;
+            return Action::FocusPlayer(self.player_focused);
+        }
+        if self.player_focused && key.code == KeyCode::Esc {
+            self.player_focused = false;
+            return Action::FocusPlayer(false);
+        }
+        if self.player_focused && !matches!(key.code, KeyCode::Char('q') | KeyCode::Char(' ')) {
+            return Action::None;
+        }
+
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = match self.focus {
+                Focus::Sidebar => Focus::Content,
+                Focus::Content => Focus::Sidebar,
+            };
+            self.status = match self.focus {
+                Focus::Sidebar => "Sidebar focused · ↑/↓ choose · Tab returns".to_owned(),
+                Focus::Content => "Content focused · arrows or hjkl navigate".to_owned(),
+            };
+            return Action::None;
+        }
+
+        if self.focus == Focus::Sidebar {
+            return match key.code {
+                KeyCode::Char('/') => {
+                    self.search_active = true;
+                    self.status = "Search TIDAL".to_owned();
+                    Action::None
+                }
+                KeyCode::Char('g') => self.switch_screen(Screen::ForYou),
+                KeyCode::Char('e') => self.switch_screen(Screen::Explore),
+                KeyCode::Char('c') => self.switch_screen(Screen::Collection),
+                KeyCode::Char('P') => self.switch_screen(Screen::Playlists),
+                KeyCode::Down | KeyCode::Char('j') => self.move_screen(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_screen(-1),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    self.focus = Focus::Content;
+                    self.status = "Content focused · arrows or hjkl navigate".to_owned();
+                    Action::None
+                }
+                KeyCode::Char('q') => Action::Quit,
+                _ => Action::None,
+            };
         }
 
         match key.code {
@@ -210,6 +284,14 @@ impl App {
         Action::None
     }
 
+    fn move_screen(&mut self, delta: isize) -> Action {
+        let current = Screen::ALL
+            .iter()
+            .position(|screen| *screen == self.screen)
+            .unwrap_or_default();
+        self.switch_screen(Screen::ALL[shifted_index(current, delta, Screen::ALL.len())])
+    }
+
     fn switch_screen(&mut self, screen: Screen) -> Action {
         self.screen = screen;
         self.selected_shelf = 0;
@@ -303,6 +385,44 @@ mod tests {
 
         assert_eq!(app.selected_item, 2);
         assert_eq!(app.shelves[0].title, "Custom mixes");
+    }
+
+    #[test]
+    fn help_overlay_captures_keys_until_closed() {
+        let mut app = App::new(false);
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('?'))), Action::None);
+        assert!(app.help_visible);
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::None);
+        assert!(!app.help_visible);
+    }
+
+    #[test]
+    fn tab_focuses_the_sidebar_and_arrows_load_views() {
+        let mut app = App::new(false);
+
+        app.handle_key(key(KeyCode::Tab));
+        let action = app.handle_key(key(KeyCode::Down));
+
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.screen, Screen::Explore);
+        assert_eq!(action, Action::Load(Screen::Explore));
+    }
+
+    #[test]
+    fn player_focus_toggles_with_f_and_escape() {
+        let mut app = App::new(false);
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('f'))),
+            Action::FocusPlayer(true)
+        );
+        assert!(app.player_focused);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)),
+            Action::FocusPlayer(false)
+        );
+        assert!(!app.player_focused);
     }
 
     #[test]
