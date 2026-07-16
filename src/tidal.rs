@@ -325,16 +325,11 @@ fn media_item(
         ),
         _ => return None,
     };
-    let artist_names = relationship_identifiers(
-        Some(&Value::Object(
-            resource.relationships.clone().into_iter().collect(),
-        )),
-        "artists",
-    )
-    .into_iter()
-    .filter_map(|identifier| resources.get(&identifier))
-    .filter_map(|artist| attribute(artist, "name"))
-    .collect::<Vec<_>>();
+    let artist_names = relationship_identifiers(Some(&relationships_value(resource)), "artists")
+        .into_iter()
+        .filter_map(|identifier| resources.get(&identifier))
+        .filter_map(|artist| attribute(artist, "name"))
+        .collect::<Vec<_>>();
     let subtitle = if !artist_names.is_empty() {
         artist_names.join(", ")
     } else {
@@ -342,16 +337,40 @@ fn media_item(
             .unwrap_or_else(|| kind_label(&kind))
             .to_owned()
     };
-    let artwork_url = ["coverArt", "profileArt"]
+    let artwork_url = artwork_url(resource, resources);
+
+    Some(MediaItem {
+        id: resource.id.clone(),
+        title: title.to_owned(),
+        subtitle,
+        kind,
+        artwork_url,
+        preview_url: None,
+    })
+}
+
+// Tracks reference their cover art indirectly through their album, so a
+// track resource without its own coverArt/profileArt relationship falls back
+// to the artwork of its album.
+fn artwork_url(
+    resource: &Resource,
+    resources: &HashMap<(String, String), &Resource>,
+) -> Option<String> {
+    direct_artwork_url(resource, resources).or_else(|| {
+        relationship_identifiers(Some(&relationships_value(resource)), "albums")
+            .into_iter()
+            .filter_map(|identifier| resources.get(&identifier))
+            .find_map(|album| direct_artwork_url(album, resources))
+    })
+}
+
+fn direct_artwork_url(
+    resource: &Resource,
+    resources: &HashMap<(String, String), &Resource>,
+) -> Option<String> {
+    ["coverArt", "profileArt"]
         .into_iter()
-        .flat_map(|name| {
-            relationship_identifiers(
-                Some(&Value::Object(
-                    resource.relationships.clone().into_iter().collect(),
-                )),
-                name,
-            )
-        })
+        .flat_map(|name| relationship_identifiers(Some(&relationships_value(resource)), name))
         .filter_map(|identifier| resources.get(&identifier))
         .flat_map(|artwork| {
             artwork
@@ -369,16 +388,11 @@ fn media_item(
         })
         .and_then(|file| file.get("href"))
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+        .map(ToOwned::to_owned)
+}
 
-    Some(MediaItem {
-        id: resource.id.clone(),
-        title: title.to_owned(),
-        subtitle,
-        kind,
-        artwork_url,
-        preview_url: None,
-    })
+fn relationships_value(resource: &Resource) -> Value {
+    Value::Object(resource.relationships.clone().into_iter().collect())
 }
 
 fn attribute<'a>(resource: &'a Resource, name: &str) -> Option<&'a str> {
@@ -469,6 +483,42 @@ mod tests {
         assert_eq!(items[0].title, "Reach for the Dead");
         assert_eq!(items[0].subtitle, "Boards of Canada");
         assert_eq!(items[1].kind, MediaKind::Album);
+    }
+
+    #[test]
+    fn track_artwork_falls_back_to_its_albums_cover_art() {
+        let document = json!({
+            "data": [{"type": "tracks", "id": "track-1"}],
+            "included": [
+                {
+                    "type": "tracks",
+                    "id": "track-1",
+                    "attributes": {"title": "Reach for the Dead"},
+                    "relationships": {"albums": {"data": [{"type": "albums", "id": "album-1"}]}}
+                },
+                {
+                    "type": "albums",
+                    "id": "album-1",
+                    "attributes": {"title": "Tomorrow's Harvest"},
+                    "relationships": {"coverArt": {"data": [{"type": "artworks", "id": "artwork-1"}]}}
+                },
+                {
+                    "type": "artworks",
+                    "id": "artwork-1",
+                    "attributes": {
+                        "files": [{"href": "https://example.com/cover.jpg", "meta": {"width": 640}}]
+                    }
+                }
+            ]
+        });
+
+        let items = items_from_document(&document, None);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].artwork_url.as_deref(),
+            Some("https://example.com/cover.jpg")
+        );
     }
 
     #[test]

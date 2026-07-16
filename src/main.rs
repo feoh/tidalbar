@@ -273,9 +273,9 @@ async fn run_app(
     let resolver = PreviewResolver;
     let mut player = MpvEngine::new();
 
-    loop {
-        terminal.draw(|frame| ui::draw(frame, app, artwork.as_deref_mut()))?;
+    terminal.draw(|frame| ui::draw(frame, app, artwork.as_deref_mut()))?;
 
+    loop {
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -371,6 +371,8 @@ async fn run_app(
         if selected_after != selected_before {
             update_artwork(tidal, app.selected(), artwork.as_deref_mut()).await;
         }
+
+        terminal.draw(|frame| ui::draw(frame, app, artwork.as_deref_mut()))?;
     }
 
     if let Err(error) = player.stop() {
