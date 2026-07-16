@@ -9,6 +9,12 @@ Rust and [Ratatui](https://ratatui.rs).
 > until TIDAL grants written permission. The current playback boundary accepts
 > official preview URLs only.
 
+## Screenshot
+
+![tidalbar player focus view showing cover art and now-playing details](Tidalbar_Screenshot.png)
+
+![tidalbar For You screen showing a vertical track list and cover art](Tidalbar_SongList_Screenshot.png)
+
 ## Vision
 
 tidalbar aims to combine the exploration depth of TIDAL's web application with
@@ -81,8 +87,8 @@ cargo run -- doctor
 | `c` | Collection |
 | `P` | Playlists |
 | `/` | Search |
-| `h`/`l` or arrows | Move within a shelf |
-| `j`/`k` or arrows | Move between shelves |
+| `j`/`k` or arrows | Move within a shelf |
+| `h`/`l` or arrows | Move between shelves |
 | `Enter` or `p` | Open albums/artists/playlists or play a track preview |
 | `Backspace` or `Esc` | Return from a detail view |
 | `Space` | Pause or resume |
