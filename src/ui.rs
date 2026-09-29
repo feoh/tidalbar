@@ -222,9 +222,9 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Some(item) => (
             item.title.as_str(),
             item.subtitle.as_str(),
-            if app.paused { "Paused" } else { "Preview" },
+            if app.paused { "Paused" } else { "Playing" },
         ),
-        None => ("Nothing playing", "Select an official preview", "Stopped"),
+        None => ("Nothing playing", "Select a track to play", "Stopped"),
     };
     let controls = if app.now_playing.is_some() {
         "Space pause/resume"
@@ -299,11 +299,7 @@ fn render_player_focus(
             item.title.as_str(),
             item.subtitle.as_str(),
             if app.now_playing.is_some() {
-                if app.paused {
-                    "PAUSED"
-                } else {
-                    "OFFICIAL PREVIEW"
-                }
+                if app.paused { "PAUSED" } else { "PLAYING" }
             } else {
                 "SELECTED"
             },
@@ -370,7 +366,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  Tab / Shift-Tab   Move between sidebar and content"),
         Line::from("  ↑ ↓ or j k        Sidebar: choose view · Content: choose track"),
         Line::from("  ← → or h l        Sidebar: enter content · Content: switch shelf"),
-        Line::from("  Enter / p         Open selection or play track preview"),
+        Line::from("  Enter / p         Open selection or play track"),
         Line::from("  Backspace / Esc   Return from a detail view"),
         Line::default(),
         Line::styled(
@@ -451,6 +447,22 @@ mod tests {
     }
 
     #[test]
+    fn idle_player_and_help_do_not_advertise_previews() {
+        let mut app = App::new(false);
+        app.help_visible = true;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &app, None))
+            .expect("draw succeeds");
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("Select a track to play"));
+        assert!(text.contains("Open selection or play track"));
+        assert!(!text.contains("preview"));
+    }
+
+    #[test]
     fn player_focus_uses_the_full_view() {
         let mut app = App::new(false);
         app.player_focused = true;
@@ -465,6 +477,42 @@ mod tests {
         assert!(text.contains("Player focus"));
         assert!(text.contains("Cover art"));
         assert!(text.contains("Now playing"));
+    }
+
+    #[test]
+    fn player_labels_match_playback_and_pause_states() {
+        let mut app = App::new(true);
+        app.playback_started(crate::models::MediaItem::new(
+            "1",
+            "Track",
+            "Artist",
+            crate::models::MediaKind::Track,
+        ));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &app, None))
+            .expect("draw succeeds");
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("Playing"));
+        assert!(!text.contains("Preview"));
+
+        app.player_focused = true;
+        terminal
+            .draw(|frame| draw(frame, &app, None))
+            .expect("draw succeeds");
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("PLAYING"));
+        assert!(!text.contains("PREVIEW"));
+
+        app.paused = true;
+        terminal
+            .draw(|frame| draw(frame, &app, None))
+            .expect("draw succeeds");
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("PAUSED"));
+        assert!(!text.contains("PREVIEW"));
     }
 
     #[test]

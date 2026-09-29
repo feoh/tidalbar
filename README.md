@@ -10,7 +10,10 @@ Rust and [Ratatui](https://ratatui.rs).
 > refuse developer-app tokens or stop working without notice. No DRM bypass is
 > implemented.
 
-## Screenshot
+## Screenshots
+
+These screenshots predate full-track playback and show outdated preview labels;
+the current UI displays **Playing** instead.
 
 ![tidalbar player focus view showing cover art and now-playing details](Tidalbar_Screenshot.png)
 
@@ -37,8 +40,8 @@ The initial application shell is usable and includes:
 - Persistent local playback through `mpv` for unencrypted full-track BTS streams
   from the unsupported private API (subject to account/API authorization)
 - Secure OAuth PKCE login, refresh, and OS credential-store persistence
-- Official search, collection, playlist, recommendation-mix, artwork, and
-  preview-manifest API integration; private full-track playback request
+- Official search, collection, playlist, recommendation-mix, and artwork API
+  integration; private full-track playback requests
 - Album, artist, and playlist drill-down with back navigation
 - Configuration in the platform-standard user configuration directory
 
@@ -126,8 +129,8 @@ with `assetpresentation=FULL` and `audioquality=HIGH` (the default in High
 Tide's `tidalapi` dependency), as High Tide's unofficial
 `tidalapi` client does. tidalbar fetches the account's country code from the
 official `/users/me` endpoint and plays only HTTPS URLs from unencrypted BTS
-manifests. MPD and encrypted manifests are not supported. The official-preview
-resolver remains available for local placeholder items when not authenticated.
+manifests. MPD and encrypted manifests are not supported. Authenticated playback
+never falls back to an official preview; unsupported tracks report an error.
 
 This is **not** a supported TIDAL integration. In particular, tidalbar's
 existing developer-app OAuth token may be rejected by the private API: High

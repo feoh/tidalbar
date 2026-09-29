@@ -76,7 +76,7 @@ impl App {
         let status = if authenticated {
             "Connected to TIDAL"
         } else {
-            "Preview build · authenticate with `tidalbar auth login` when configured"
+            "Not connected · configure TIDAL, then run `tidalbar auth login`"
         };
 
         Self {
@@ -240,7 +240,7 @@ impl App {
     }
 
     pub fn playback_started(&mut self, item: MediaItem) {
-        self.status = format!("Playing official preview · {}", item.title);
+        self.status = format!("Playing · {}", item.title);
         self.now_playing = Some(item);
         self.paused = false;
     }
@@ -423,6 +423,17 @@ mod tests {
             Action::FocusPlayer(false)
         );
         assert!(!app.player_focused);
+    }
+
+    #[test]
+    fn playback_status_describes_the_track_without_claiming_it_is_a_preview() {
+        let mut app = App::new(true);
+        let track = MediaItem::new("track", "Track", "Artist", crate::models::MediaKind::Track);
+
+        app.playback_started(track.clone());
+
+        assert_eq!(app.now_playing, Some(track));
+        assert_eq!(app.status, "Playing · Track");
     }
 
     #[test]

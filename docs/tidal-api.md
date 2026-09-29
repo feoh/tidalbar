@@ -36,24 +36,24 @@ must exactly match a redirect registered in TIDAL's developer dashboard.
 - `/userDailyMixes/me`
 - `/userDiscoveryMixes/me`
 - `/userNewReleaseMixes/me`
-- `/trackManifests/{track-id}` for official preview manifests
+- `/users/me` for the account country used in private playback requests
 
 Search text is a query parameter; resource IDs are opaque path segments and
-must be URL encoded. Album,
-artist, playlist, track, and artwork resources arrive in top-level `included`
-data and are joined through JSON:API relationship identifiers.
+must be URL encoded. Album, artist, playlist, track, and artwork resources
+arrive in top-level `included` data and are joined through JSON:API
+relationship identifiers.
 
 ## Playback
 
-The official track-manifest endpoint can return `FULL` or `PREVIEW`. The
-`official_preview` method still rejects `FULL` and DRM-protected responses.
-Authenticated playback gets the country code from the documented `/users/me`
-resource, then calls the *undocumented* `api.tidal.com/v1`
-`/tracks/{id}/playbackinfopostpaywall` with `audioquality=HIGH`,
+Authenticated playback does not use preview manifests. It gets the country code
+from the documented `/users/me` resource, then calls the *undocumented*
+`api.tidal.com/v1/tracks/{id}/playbackinfopostpaywall` with `audioquality=HIGH`,
 `assetpresentation=FULL`, and `playbackmode=STREAM`. This matches the full-track
 request made by the `tidalapi` dependency in High Tide; it is not part of the
 public API contract. Only unencrypted BTS manifests with HTTPS media URLs can
-be handed to mpv. MPD and encrypted manifests produce explicit errors.
+be handed to mpv. MPD and encrypted manifests produce explicit errors rather
+than falling back to a preview. The legacy `official_preview` method remains
+in the codebase, but it is not called for authenticated playback.
 
 TIDAL does not support private-API clients and can reject the developer-app
 OAuth token currently used for the official catalog. No client credentials are
