@@ -2,12 +2,6 @@
 
 ## Product constraints
 
-- Full-track playback must remain disabled until TIDAL grants written
-  permission. Do not add undocumented stream extraction, DRM circumvention, or
-  access-control bypasses.
-- Official previews are the only currently supported TIDAL playback resources.
-- Never commit client secrets, OAuth tokens, stream URLs, or private API
-  responses. The distributed application must work as an OAuth public client.
 - Linux and macOS are first-class. Keep Windows compiling and tested when
   platform-specific code changes.
 
