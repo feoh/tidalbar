@@ -5,9 +5,10 @@ Rust and [Ratatui](https://ratatui.rs).
 
 > [!IMPORTANT]
 > tidalbar is an independent, early-stage project and is not affiliated with or
-> endorsed by TIDAL. Full-track playback is deliberately disabled unless and
-> until TIDAL grants written permission. The current playback boundary accepts
-> official preview URLs only.
+> endorsed by TIDAL. Full-track playback uses the undocumented API used by High
+> Tide's `tidalapi` dependency. TIDAL does not support this integration; it may
+> refuse developer-app tokens or stop working without notice. No DRM bypass is
+> implemented.
 
 ## Screenshot
 
@@ -33,10 +34,11 @@ The initial application shell is usable and includes:
 - Keyboard navigation and search input
 - Automatic Kitty, iTerm2, Sixel, or Unicode half-block artwork selection
 - A replaceable media-resolver and audio-engine boundary
-- Persistent local playback through `mpv` for official previews
+- Persistent local playback through `mpv` for unencrypted full-track BTS streams
+  from the unsupported private API (subject to account/API authorization)
 - Secure OAuth PKCE login, refresh, and OS credential-store persistence
 - Official search, collection, playlist, recommendation-mix, artwork, and
-  preview-manifest API integration
+  preview-manifest API integration; private full-track playback request
 - Album, artist, and playlist drill-down with back navigation
 - Configuration in the platform-standard user configuration directory
 
@@ -89,7 +91,7 @@ cargo run -- doctor
 | `/` | Search |
 | `j`/`k` or arrows | Move within a shelf |
 | `h`/`l` or arrows | Move between shelves |
-| `Enter` or `p` | Open albums/artists/playlists or play a track preview |
+| `Enter` or `p` | Open albums/artists/playlists or play a track |
 | `Backspace` or `Esc` | Return from a detail view |
 | `Space` | Pause or resume |
 | `f` | Toggle the large-art player focus view |
@@ -119,10 +121,19 @@ Playback is split into two interfaces:
    resources.
 2. An **audio engine** sends those resources to a persistent `mpv` process.
 
-Only the official-preview resolver is included today. This separation leaves a
-clean integration point for a future TIDAL-approved playback SDK or service
-without coupling access policy to the TUI. Code that bypasses DRM, subscription
-checks, geographic restrictions, or other access controls is out of scope.
+Authenticated tracks now request `api.tidal.com/v1/tracks/{id}/playbackinfopostpaywall`
+with `assetpresentation=FULL` and `audioquality=HIGH` (the default in High
+Tide's `tidalapi` dependency), as High Tide's unofficial
+`tidalapi` client does. tidalbar fetches the account's country code from the
+official `/users/me` endpoint and plays only HTTPS URLs from unencrypted BTS
+manifests. MPD and encrypted manifests are not supported. The official-preview
+resolver remains available for local placeholder items when not authenticated.
+
+This is **not** a supported TIDAL integration. In particular, tidalbar's
+existing developer-app OAuth token may be rejected by the private API: High
+Tide authenticates through a different client flow. `tidalbar doctor` reports
+this failure without printing stream URLs. No third-party client credentials or
+DRM workarounds are included. TIDAL can change this endpoint at any time.
 
 ## Development
 

@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Test credentials and official API access without displaying user data.
+    /// Test credentials and API access without displaying user data or stream URLs.
     Doctor,
     /// Inspect or update non-secret local configuration.
     Config {
@@ -213,7 +213,17 @@ async fn run_doctor() -> Result<()> {
         };
     }
 
-    check_items!("collection tracks", client.collection_tracks());
+    let collection_tracks = match client.collection_tracks().await {
+        Ok(items) => {
+            println!("✓ collection tracks: {} items", items.len());
+            items
+        }
+        Err(error) => {
+            println!("✗ collection tracks: {error}");
+            failures.push("collection tracks");
+            Vec::new()
+        }
+    };
     check_items!("collection albums", client.collection_albums());
     check_items!("collection artists", client.collection_artists());
     check_items!("collection playlists", client.collection_playlists());
@@ -240,18 +250,16 @@ async fn run_doctor() -> Result<()> {
         check_items!("playlist drill-down", client.playlist_items(&playlist.id));
     }
 
-    if let Some(track) = search_items
+    if let Some(track) = collection_tracks
         .iter()
+        .chain(search_items.iter())
         .find(|item| item.kind == MediaKind::Track)
     {
-        match client.official_preview(&track.id).await {
-            Ok(_) => println!("✓ official preview manifest"),
-            Err(tidalbar::tidal::TidalError::FullTrackDisabled) => {
-                println!("✓ playback policy rejected a full-track manifest")
-            }
+        match client.unofficial_full_track(&track.id).await {
+            Ok(_) => println!("✓ private full-track playback manifest"),
             Err(error) => {
-                println!("✗ official preview manifest: {error}");
-                failures.push("official preview manifest");
+                println!("✗ private full-track playback manifest: {error}");
+                failures.push("private full-track playback manifest");
             }
         }
     }
@@ -321,15 +329,12 @@ async fn run_app(
             }
             Action::Play(item) => match item.kind {
                 MediaKind::Track => {
-                    let resource = match resolver.resolve(&item) {
-                        Ok(resource) => Ok(resource),
-                        Err(error) => match tidal {
-                            Some(client) => client
-                                .official_preview(&item.id)
-                                .await
-                                .map_err(|error| error.to_string()),
-                            None => Err(error.to_string()),
-                        },
+                    let resource = match tidal {
+                        Some(client) => client
+                            .unofficial_full_track(&item.id)
+                            .await
+                            .map_err(|error| error.to_string()),
+                        None => resolver.resolve(&item).map_err(|error| error.to_string()),
                     };
                     match resource {
                         Ok(resource) => match player.play(&resource) {
@@ -393,12 +398,12 @@ async fn load_screen(
                 client.discovery_mixes(),
                 client.new_release_mixes()
             );
-            let mixes = shelves_from_results([
+            if let Ok(mixes) = shelves_from_results([
                 ("Daily mixes", daily),
                 ("Discovery mixes", discovery),
                 ("New releases", new_releases),
-            ])?;
-            if !mixes.is_empty() {
+            ]) && !mixes.is_empty()
+            {
                 return Ok(mixes);
             }
 

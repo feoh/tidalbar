@@ -11,6 +11,7 @@ use crate::models::MediaItem;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioQuality {
     Preview,
+    Full,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

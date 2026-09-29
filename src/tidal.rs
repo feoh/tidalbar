@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::Engine;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -10,6 +11,7 @@ use crate::models::{MediaItem, MediaKind};
 use crate::playback::{AudioQuality, PlayableResource};
 
 const API_BASE: &str = "https://openapi.tidal.com/v2";
+const PRIVATE_API_BASE: &str = "https://api.tidal.com/v1";
 const JSON_API: &str = "application/vnd.api+json";
 
 #[derive(Debug, Error)]
@@ -26,6 +28,8 @@ pub enum TidalError {
     PreviewDrmUnsupported,
     #[error("TIDAL did not provide an official preview")]
     PreviewUnavailable,
+    #[error("private TIDAL playback is unavailable: {0}")]
+    PrivatePlayback(String),
 }
 
 #[derive(Clone, Debug)]
@@ -45,11 +49,14 @@ impl TidalClient {
     pub async fn search(&self, query: &str) -> Result<Vec<MediaItem>, TidalError> {
         let document = self
             .get(
-                &["searchResults", query],
-                &[(
-                    "include",
-                    "topHits,tracks,tracks.artists,albums,albums.artists,albums.coverArt,artists,artists.profileArt,playlists,playlists.coverArt",
-                )],
+                &["searchResults"],
+                &[
+                    ("filter[query]", query),
+                    (
+                        "include",
+                        "topHits,tracks,tracks.artists,albums,albums.artists,albums.coverArt,artists,artists.profileArt,playlists,playlists.coverArt",
+                    ),
+                ],
             )
             .await?;
         Ok(items_from_document(
@@ -195,6 +202,50 @@ impl TidalClient {
         })
     }
 
+    /// High Tide's tidalapi uses this undocumented endpoint for full tracks.
+    /// Only unencrypted BTS manifests are usable by the current mpv engine.
+    pub async fn unofficial_full_track(
+        &self,
+        track_id: &str,
+    ) -> Result<PlayableResource, TidalError> {
+        // Developer-app tokens need not expose the legacy /sessions fields.
+        // Use the account's documented country instead of guessing a market.
+        let user = self.get(&["users", "me"], &[]).await?;
+        let country_code = user
+            .pointer("/data/attributes/country")
+            .and_then(Value::as_str)
+            .filter(|code| code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_alphabetic()))
+            .ok_or_else(|| TidalError::InvalidResponse("account country missing".to_owned()))?;
+        let url = private_url(
+            &["tracks", track_id, "playbackinfopostpaywall"],
+            &[
+                ("countryCode", country_code),
+                ("audioquality", "HIGH"),
+                ("playbackmode", "STREAM"),
+                ("assetpresentation", "FULL"),
+            ],
+        )?;
+        let document = self.private_get(url).await?;
+        full_track_from_document(&document)
+    }
+
+    async fn private_get(&self, url: Url) -> Result<Value, TidalError> {
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(TidalError::PrivatePlayback(format!(
+                "private API returned {status}; the developer-app OAuth token may not be authorized for High Tide's endpoint"
+            )));
+        }
+        decode_response(status, &bytes)
+    }
+
     pub async fn artwork(&self, url: &str) -> Result<Vec<u8>, TidalError> {
         let response = self
             .http
@@ -216,16 +267,7 @@ impl TidalClient {
     }
 
     async fn mix_items(&self, resource: &str) -> Result<Vec<MediaItem>, TidalError> {
-        let document = match self
-            .get(
-                &[resource, "me"],
-                &[(
-                    "include",
-                    "items,items.artists,items.albums,items.coverArt,items.profileArt",
-                )],
-            )
-            .await
-        {
+        let document = match self.get(&[resource, "me"], &[("include", "items")]).await {
             Ok(document) => document,
             Err(TidalError::Api { status, .. }) if status == StatusCode::NOT_FOUND => {
                 return Ok(Vec::new());
@@ -259,6 +301,65 @@ impl TidalClient {
     }
 }
 
+fn private_url(segments: &[&str], query: &[(&str, &str)]) -> Result<Url, TidalError> {
+    let mut url = Url::parse(PRIVATE_API_BASE)
+        .map_err(|error| TidalError::InvalidResponse(error.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|()| TidalError::InvalidResponse("invalid private API base URL".to_owned()))?
+        .extend(segments);
+    url.query_pairs_mut().extend_pairs(query.iter().copied());
+    Ok(url)
+}
+
+fn full_track_from_document(document: &Value) -> Result<PlayableResource, TidalError> {
+    if document.get("manifestMimeType").and_then(Value::as_str) != Some("application/vnd.tidal.bts")
+    {
+        return Err(TidalError::PrivatePlayback(
+            "this track uses a manifest format the mpv integration cannot play".to_owned(),
+        ));
+    }
+    let encoded = document
+        .get("manifest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            TidalError::InvalidResponse("private playback manifest missing".to_owned())
+        })?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| {
+            TidalError::InvalidResponse("invalid private playback manifest encoding".to_owned())
+        })?;
+    let manifest: Value = serde_json::from_slice(&decoded).map_err(|_| {
+        TidalError::InvalidResponse("invalid private playback manifest JSON".to_owned())
+    })?;
+    if manifest.get("encryptionType").and_then(Value::as_str) != Some("NONE") {
+        return Err(TidalError::PrivatePlayback(
+            "encrypted tracks are not supported".to_owned(),
+        ));
+    }
+    let uri = manifest
+        .get("urls")
+        .and_then(Value::as_array)
+        .and_then(|urls| urls.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| TidalError::InvalidResponse("private playback URL missing".to_owned()))?;
+    let url = Url::parse(uri)
+        .map_err(|_| TidalError::InvalidResponse("invalid private playback URL".to_owned()))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(TidalError::InvalidResponse(
+            "private playback URL must be HTTPS".to_owned(),
+        ));
+    }
+    Ok(PlayableResource {
+        uri: url.to_string(),
+        quality: AudioQuality::Full,
+    })
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct Resource {
     id: String,
@@ -285,9 +386,17 @@ fn items_from_document(document: &Value, relationship_order: Option<&[&str]>) ->
         let Some(primary) = document.get("data") else {
             return Vec::new();
         };
-        order
-            .iter()
-            .flat_map(|name| relationship_identifiers(primary.get("relationships"), name))
+        let primaries = primary
+            .as_array()
+            .map_or_else(|| vec![primary], |items| items.iter().collect());
+        primaries
+            .into_iter()
+            .flat_map(|item| {
+                order
+                    .iter()
+                    .flat_map(|name| relationship_identifiers(item.get("relationships"), name))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     } else {
         identifiers(document.get("data"))
@@ -465,6 +574,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_playback_url_encodes_track_id_and_country() {
+        let url = private_url(
+            &["tracks", "a/b ?", "playbackinfopostpaywall"],
+            &[("countryCode", "US")],
+        )
+        .expect("valid URL");
+        assert_eq!(url.path(), "/v1/tracks/a%2Fb%20%3F/playbackinfopostpaywall");
+        assert_eq!(url.query(), Some("countryCode=US"));
+    }
+
+    #[test]
+    fn unencrypted_bts_manifest_maps_to_full_track() {
+        let manifest = json!({"encryptionType": "NONE", "urls": ["https://cdn.example.test/audio.flac?sig=abc"]});
+        let encoded = base64::engine::general_purpose::STANDARD.encode(manifest.to_string());
+        let resource = full_track_from_document(&json!({
+            "manifestMimeType": "application/vnd.tidal.bts", "manifest": encoded
+        }))
+        .expect("unencrypted stream");
+        assert_eq!(resource.quality, AudioQuality::Full);
+        assert_eq!(resource.uri, "https://cdn.example.test/audio.flac?sig=abc");
+    }
+
+    #[test]
+    fn private_playback_rejects_encryption_and_unsafe_urls() {
+        for manifest in [
+            json!({"encryptionType": "AES", "urls": ["https://cdn.example.test/track"]}),
+            json!({"encryptionType": "NONE", "urls": ["file:///etc/passwd"]}),
+            json!({"encryptionType": "NONE", "urls": ["http://localhost/track"]}),
+        ] {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(manifest.to_string());
+            assert!(
+                full_track_from_document(&json!({
+                    "manifestMimeType": "application/vnd.tidal.bts", "manifest": encoded
+                }))
+                .is_err()
+            );
+        }
+        assert!(
+            full_track_from_document(&json!({"manifestMimeType": "application/dash+xml"})).is_err()
+        );
+    }
+
+    #[test]
     fn search_document_maps_relationship_order_and_artist_names() {
         let document = json!({
             "data": {
@@ -499,6 +651,19 @@ mod tests {
         assert_eq!(items[0].title, "Reach for the Dead");
         assert_eq!(items[0].subtitle, "Boards of Canada");
         assert_eq!(items[1].kind, MediaKind::Album);
+    }
+
+    #[test]
+    fn search_results_array_maps_included_tracks() {
+        let document = json!({
+            "data": [{"type": "searchResults", "relationships": {
+                "tracks": {"data": [{"type": "tracks", "id": "1"}]}
+            }}],
+            "included": [{"type": "tracks", "id": "1", "attributes": {"title": "Track"}}]
+        });
+        let items = items_from_document(&document, Some(&["tracks"]));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Track");
     }
 
     #[test]
