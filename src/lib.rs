@@ -7,6 +7,7 @@ pub mod app;
 pub mod artwork;
 pub mod auth;
 pub mod config;
+pub mod high_tide_auth;
 pub mod models;
 pub mod playback;
 pub mod tidal;

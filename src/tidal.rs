@@ -8,7 +8,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::models::{MediaItem, MediaKind};
-use crate::playback::{AudioQuality, PlayableResource};
+use crate::playback::{AudioQuality, PlayableResource, PlayableSource};
 
 const API_BASE: &str = "https://openapi.tidal.com/v2";
 const PRIVATE_API_BASE: &str = "https://api.tidal.com/v1";
@@ -197,7 +197,7 @@ impl TidalClient {
             .filter(|uri| !uri.is_empty())
             .ok_or(TidalError::PreviewUnavailable)?;
         Ok(PlayableResource {
-            uri: uri.to_owned(),
+            source: PlayableSource::Url(uri.to_owned()),
             quality: AudioQuality::Preview,
         })
     }
@@ -208,23 +208,22 @@ impl TidalClient {
         &self,
         track_id: &str,
     ) -> Result<PlayableResource, TidalError> {
-        // Developer-app tokens need not expose the legacy /sessions fields.
-        // Use the account's documented country instead of guessing a market.
-        let user = self.get(&["users", "me"], &[]).await?;
-        let country_code = user
-            .pointer("/data/attributes/country")
+        let session = self.private_get(private_url(&["sessions"], &[])?).await?;
+        let country_code = session
+            .get("countryCode")
             .and_then(Value::as_str)
             .filter(|code| code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_alphabetic()))
-            .ok_or_else(|| TidalError::InvalidResponse("account country missing".to_owned()))?;
-        let url = private_url(
-            &["tracks", track_id, "playbackinfopostpaywall"],
-            &[
-                ("countryCode", country_code),
-                ("audioquality", "HIGH"),
-                ("playbackmode", "STREAM"),
-                ("assetpresentation", "FULL"),
-            ],
-        )?;
+            .ok_or_else(|| {
+                TidalError::InvalidResponse("private session countryCode missing".to_owned())
+            })?;
+        let session_id = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                TidalError::InvalidResponse("private session sessionId missing".to_owned())
+            })?;
+        let url = private_playback_url(track_id, session_id, country_code)?;
         let document = self.private_get(url).await?;
         full_track_from_document(&document)
     }
@@ -235,12 +234,23 @@ impl TidalClient {
             .get(url)
             .bearer_auth(&self.access_token)
             .send()
-            .await?;
+            .await
+            .map_err(|error| TidalError::Network(error.without_url()))?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| TidalError::Network(error.without_url()))?;
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             return Err(TidalError::PrivatePlayback(format!(
-                "private API returned {status}; the developer-app OAuth token may not be authorized for High Tide's endpoint"
+                "private API returned {status}; this playback login is not authorized for the requested track"
+            )));
+        }
+        if !status.is_success() {
+            // Private requests carry a session ID in the URL. Never echo
+            // response bodies that might reflect it back into UI or logs.
+            return Err(TidalError::PrivatePlayback(format!(
+                "private API returned {status}"
             )));
         }
         decode_response(status, &bytes)
@@ -311,11 +321,27 @@ fn private_url(segments: &[&str], query: &[(&str, &str)]) -> Result<Url, TidalEr
     Ok(url)
 }
 
+fn private_playback_url(
+    track_id: &str,
+    session_id: &str,
+    country_code: &str,
+) -> Result<Url, TidalError> {
+    private_url(
+        &["tracks", track_id, "playbackinfopostpaywall"],
+        &[
+            ("sessionId", session_id),
+            ("countryCode", country_code),
+            ("audioquality", "HIGH"),
+            ("playbackmode", "STREAM"),
+            ("assetpresentation", "FULL"),
+        ],
+    )
+}
+
 fn full_track_from_document(document: &Value) -> Result<PlayableResource, TidalError> {
-    if document.get("manifestMimeType").and_then(Value::as_str) != Some("application/vnd.tidal.bts")
-    {
+    if document.get("assetPresentation").and_then(Value::as_str) != Some("FULL") {
         return Err(TidalError::PrivatePlayback(
-            "this track uses a manifest format the mpv integration cannot play".to_owned(),
+            "TIDAL returned a short preview instead of a full track; this playback login or track is not entitled to full playback".to_owned(),
         ));
     }
     let encoded = document
@@ -329,7 +355,23 @@ fn full_track_from_document(document: &Value) -> Result<PlayableResource, TidalE
         .map_err(|_| {
             TidalError::InvalidResponse("invalid private playback manifest encoding".to_owned())
         })?;
-    let manifest: Value = serde_json::from_slice(&decoded).map_err(|_| {
+    let source = match document.get("manifestMimeType").and_then(Value::as_str) {
+        Some("application/vnd.tidal.bts") => bts_source(&decoded)?,
+        Some("application/dash+xml") => dash_source(&decoded)?,
+        _ => {
+            return Err(TidalError::PrivatePlayback(
+                "unsupported playback manifest format".to_owned(),
+            ));
+        }
+    };
+    Ok(PlayableResource {
+        source,
+        quality: AudioQuality::Full,
+    })
+}
+
+fn bts_source(decoded: &[u8]) -> Result<PlayableSource, TidalError> {
+    let manifest: Value = serde_json::from_slice(decoded).map_err(|_| {
         TidalError::InvalidResponse("invalid private playback manifest JSON".to_owned())
     })?;
     if manifest.get("encryptionType").and_then(Value::as_str) != Some("NONE") {
@@ -343,21 +385,65 @@ fn full_track_from_document(document: &Value) -> Result<PlayableResource, TidalE
         .and_then(|urls| urls.first())
         .and_then(Value::as_str)
         .ok_or_else(|| TidalError::InvalidResponse("private playback URL missing".to_owned()))?;
-    let url = Url::parse(uri)
-        .map_err(|_| TidalError::InvalidResponse("invalid private playback URL".to_owned()))?;
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
+    if !safe_media_url(uri) {
         return Err(TidalError::InvalidResponse(
             "private playback URL must be HTTPS".to_owned(),
         ));
     }
-    Ok(PlayableResource {
-        uri: url.to_string(),
-        quality: AudioQuality::Full,
+    Ok(PlayableSource::Url(uri.to_owned()))
+}
+
+fn safe_media_url(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
     })
+}
+
+fn dash_source(decoded: &[u8]) -> Result<PlayableSource, TidalError> {
+    let xml = std::str::from_utf8(decoded)
+        .map_err(|_| TidalError::InvalidResponse("invalid DASH manifest encoding".to_owned()))?;
+    let doc = roxmltree::Document::parse(xml)
+        .map_err(|_| TidalError::InvalidResponse("invalid DASH manifest XML".to_owned()))?;
+    if doc.root_element().tag_name().name() != "MPD" {
+        return Err(TidalError::InvalidResponse(
+            "DASH manifest root is not MPD".to_owned(),
+        ));
+    }
+    let mut media_urls = 0;
+    for node in doc.descendants().filter(|node| node.is_element()) {
+        if node.tag_name().name() == "ContentProtection" {
+            return Err(TidalError::PrivatePlayback(
+                "encrypted DASH tracks are not supported".to_owned(),
+            ));
+        }
+        if node.tag_name().name() == "BaseURL" && !node.text().is_some_and(safe_media_url) {
+            return Err(TidalError::InvalidResponse(
+                "DASH BaseURL must be HTTPS".to_owned(),
+            ));
+        }
+        for attribute in node.attributes() {
+            if matches!(
+                attribute.name(),
+                "media" | "initialization" | "sourceURL" | "href"
+            ) {
+                if !safe_media_url(attribute.value()) {
+                    return Err(TidalError::InvalidResponse(
+                        "DASH media URLs must be HTTPS".to_owned(),
+                    ));
+                }
+                media_urls += 1;
+            }
+        }
+    }
+    if media_urls == 0 {
+        return Err(TidalError::InvalidResponse(
+            "DASH manifest has no media URLs".to_owned(),
+        ));
+    }
+    Ok(PlayableSource::DashManifest(xml.to_owned()))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -574,14 +660,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_playback_url_encodes_track_id_and_country() {
-        let url = private_url(
-            &["tracks", "a/b ?", "playbackinfopostpaywall"],
-            &[("countryCode", "US")],
-        )
-        .expect("valid URL");
+    fn private_playback_url_encodes_track_id_and_session() {
+        let url = private_playback_url("a/b ?", "session", "US").expect("valid URL");
         assert_eq!(url.path(), "/v1/tracks/a%2Fb%20%3F/playbackinfopostpaywall");
-        assert_eq!(url.query(), Some("countryCode=US"));
+        let params: HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            params.get("sessionId").map(|value| value.as_ref()),
+            Some("session")
+        );
+        assert_eq!(
+            params.get("countryCode").map(|value| value.as_ref()),
+            Some("US")
+        );
+        assert_eq!(
+            params.get("audioquality").map(|value| value.as_ref()),
+            Some("HIGH")
+        );
+        assert_eq!(
+            params.get("assetpresentation").map(|value| value.as_ref()),
+            Some("FULL")
+        );
     }
 
     #[test]
@@ -589,11 +687,14 @@ mod tests {
         let manifest = json!({"encryptionType": "NONE", "urls": ["https://cdn.example.test/audio.flac?sig=abc"]});
         let encoded = base64::engine::general_purpose::STANDARD.encode(manifest.to_string());
         let resource = full_track_from_document(&json!({
-            "manifestMimeType": "application/vnd.tidal.bts", "manifest": encoded
+            "assetPresentation": "FULL", "manifestMimeType": "application/vnd.tidal.bts", "manifest": encoded
         }))
         .expect("unencrypted stream");
         assert_eq!(resource.quality, AudioQuality::Full);
-        assert_eq!(resource.uri, "https://cdn.example.test/audio.flac?sig=abc");
+        assert_eq!(
+            resource.source,
+            PlayableSource::Url("https://cdn.example.test/audio.flac?sig=abc".to_owned())
+        );
     }
 
     #[test]
@@ -606,14 +707,39 @@ mod tests {
             let encoded = base64::engine::general_purpose::STANDARD.encode(manifest.to_string());
             assert!(
                 full_track_from_document(&json!({
-                    "manifestMimeType": "application/vnd.tidal.bts", "manifest": encoded
+                    "assetPresentation": "FULL", "manifestMimeType": "application/vnd.tidal.bts", "manifest": encoded
                 }))
                 .is_err()
             );
         }
         assert!(
-            full_track_from_document(&json!({"manifestMimeType": "application/dash+xml"})).is_err()
+            full_track_from_document(
+                &json!({"assetPresentation": "FULL", "manifestMimeType": "application/dash+xml"})
+            )
+            .is_err()
         );
+    }
+
+    #[test]
+    fn dash_manifest_accepts_unencrypted_https_segments_only() {
+        let xml = r#"<MPD mediaPresentationDuration="PT220S"><Period><AdaptationSet><Representation><SegmentTemplate initialization="https://cdn.example.test/init" media="https://cdn.example.test/segment-$Number$"/></Representation></AdaptationSet></Period></MPD>"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(xml);
+        let result = full_track_from_document(&json!({"assetPresentation":"FULL", "manifestMimeType":"application/dash+xml", "manifest":encoded})).expect("valid DASH");
+        assert_eq!(result.source, PlayableSource::DashManifest(xml.to_owned()));
+        for bad in [
+            xml.replace("https://cdn.example.test/init", "file:///etc/passwd"),
+            xml.replace("<Representation>", "<ContentProtection/><Representation>"),
+        ] {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bad);
+            assert!(full_track_from_document(&json!({"assetPresentation":"FULL", "manifestMimeType":"application/dash+xml", "manifest":encoded})).is_err());
+        }
+    }
+
+    #[test]
+    fn downgraded_preview_is_not_reported_as_full_playback() {
+        let response = json!({"assetPresentation": "PREVIEW", "audioQuality": "LOW", "manifestMimeType": "application/vnd.tidal.bts"});
+        let error = full_track_from_document(&response).expect_err("preview must be rejected");
+        assert!(error.to_string().contains("short preview"));
     }
 
     #[test]

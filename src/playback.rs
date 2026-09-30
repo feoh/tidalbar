@@ -4,6 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tempfile::{Builder, NamedTempFile};
 use thiserror::Error;
 
 use crate::models::MediaItem;
@@ -15,8 +16,14 @@ pub enum AudioQuality {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlayableSource {
+    Url(String),
+    DashManifest(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayableResource {
-    pub uri: String,
+    pub source: PlayableSource,
     pub quality: AudioQuality,
 }
 
@@ -38,7 +45,7 @@ impl MediaResolver for PreviewResolver {
         item.preview_url
             .as_ref()
             .map(|uri| PlayableResource {
-                uri: uri.clone(),
+                source: PlayableSource::Url(uri.clone()),
                 quality: AudioQuality::Preview,
             })
             .ok_or(ResolverError::FullTrackUnavailable)
@@ -58,6 +65,8 @@ pub enum PlaybackError {
     Encode(#[from] serde_json::Error),
     #[error("could not send a command to mpv: {0}")]
     Command(#[source] std::io::Error),
+    #[error("could not stage a DASH manifest for mpv: {0}")]
+    Manifest(#[source] std::io::Error),
 }
 
 pub trait AudioEngine {
@@ -71,6 +80,10 @@ pub struct MpvEngine {
     child: Option<Child>,
     ipc: Option<Box<dyn Write + Send>>,
     ipc_path: Option<String>,
+    // Keep the current manifest until mpv has finished loading it. Keep the
+    // previous one until a later play, since IPC writes do not await loadfile.
+    current_manifest: Option<NamedTempFile>,
+    previous_manifest: Option<NamedTempFile>,
 }
 
 impl MpvEngine {
@@ -99,6 +112,9 @@ impl MpvEngine {
                 "--no-video",
                 "--no-terminal",
                 "--really-quiet",
+                // DASH MPDs staged locally reference HTTPS segments. FFmpeg's
+                // default nested-protocol whitelist would reject those URLs.
+                "--demuxer-lavf-o=protocol_whitelist=[file,crypto,data,https,tcp,tls]",
                 ipc_argument.as_str(),
             ])
             .stdin(Stdio::null())
@@ -159,6 +175,8 @@ impl MpvEngine {
             let _ = child.wait();
         }
         self.child = None;
+        self.current_manifest = None;
+        self.previous_manifest = None;
         if let Some(path) = self.ipc_path.take() {
             remove_ipc_file(&path);
         }
@@ -167,7 +185,21 @@ impl MpvEngine {
 
 impl AudioEngine for MpvEngine {
     fn play(&mut self, resource: &PlayableResource) -> Result<(), PlaybackError> {
-        self.command(json!(["loadfile", resource.uri, "replace"]))
+        let new_manifest = match &resource.source {
+            PlayableSource::Url(_) => None,
+            PlayableSource::DashManifest(xml) => Some(stage_manifest(xml)?),
+        };
+        let path = match (&resource.source, new_manifest.as_ref()) {
+            (PlayableSource::Url(uri), _) => uri.clone(),
+            (PlayableSource::DashManifest(_), Some(file)) => {
+                file.path().to_string_lossy().into_owned()
+            }
+            _ => unreachable!("DASH manifest must have been staged"),
+        };
+        self.command(json!(["loadfile", path, "replace"]))?;
+        self.previous_manifest = self.current_manifest.take();
+        self.current_manifest = new_manifest;
+        Ok(())
     }
 
     fn set_paused(&mut self, paused: bool) -> Result<(), PlaybackError> {
@@ -178,7 +210,10 @@ impl AudioEngine for MpvEngine {
         if self.child.is_none() {
             return Ok(());
         }
-        self.command(json!(["stop"]))
+        self.command(json!(["stop"]))?;
+        self.current_manifest = None;
+        self.previous_manifest = None;
+        Ok(())
     }
 }
 
@@ -186,6 +221,18 @@ impl Drop for MpvEngine {
     fn drop(&mut self) {
         self.cleanup();
     }
+}
+
+fn stage_manifest(xml: &str) -> Result<NamedTempFile, PlaybackError> {
+    let mut file = Builder::new()
+        .prefix("tidalbar-")
+        .suffix(".mpd")
+        .tempfile()
+        .map_err(PlaybackError::Manifest)?;
+    file.write_all(xml.as_bytes())
+        .map_err(PlaybackError::Manifest)?;
+    file.flush().map_err(PlaybackError::Manifest)?;
+    Ok(file)
 }
 
 fn command_payload(command: Value) -> Result<Vec<u8>, serde_json::Error> {
@@ -274,8 +321,33 @@ mod tests {
 
         let resource = PreviewResolver.resolve(&item).expect("preview resolves");
 
-        assert_eq!(resource.uri, "https://example.test/preview.flac");
+        assert_eq!(
+            resource.source,
+            PlayableSource::Url("https://example.test/preview.flac".to_owned())
+        );
         assert_eq!(resource.quality, AudioQuality::Preview);
+    }
+
+    #[test]
+    fn dash_manifest_uses_a_temporary_mpd_file() {
+        let file = stage_manifest("<MPD/>").expect("stage");
+        assert_eq!(
+            file.path().extension().and_then(|ext| ext.to_str()),
+            Some("mpd")
+        );
+        assert_eq!(
+            std::fs::read_to_string(file.path()).expect("read"),
+            "<MPD/>"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = file.as_file().metadata().expect("metadata").permissions();
+            assert_eq!(permissions.mode() & 0o077, 0, "manifest must be private");
+        }
+        let path = file.path().to_owned();
+        drop(file);
+        assert!(!path.exists());
     }
 
     #[test]

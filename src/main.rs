@@ -7,8 +7,9 @@ use tidalbar::app::{Action, App, Screen};
 use tidalbar::artwork::ArtworkState;
 use tidalbar::auth::{TokenStore, login, refresh};
 use tidalbar::config::{AppConfig, config_path, config_path_display};
+use tidalbar::high_tide_auth::{self, PlaybackTokenStore};
 use tidalbar::models::{MediaItem, MediaKind, Shelf};
-use tidalbar::playback::{AudioEngine, MediaResolver, MpvEngine, PreviewResolver};
+use tidalbar::playback::{AudioEngine, MpvEngine};
 use tidalbar::tidal::TidalClient;
 use tidalbar::ui;
 
@@ -55,12 +56,16 @@ enum ConfigAction {
 
 #[derive(Debug, Subcommand)]
 enum AuthAction {
-    /// Log in through the system browser using OAuth Authorization Code + PKCE.
+    /// Log in for catalog access through your developer app.
     Login,
-    /// Report whether an OAuth token is present in the OS credential store.
+    /// Log in for full playback through the installed tidalapi PKCE flow.
+    LoginPlayback,
+    /// Report whether OAuth tokens are present in the OS credential store.
     Status,
-    /// Delete the locally stored OAuth token.
+    /// Delete the locally stored catalog authorization.
     Logout,
+    /// Delete the separately stored playback authorization.
+    LogoutPlayback,
 }
 
 #[tokio::main]
@@ -90,6 +95,29 @@ async fn main() -> Result<()> {
     let tidal = tokens
         .filter(|tokens| config.client_id.as_deref() == Some(tokens.client_id.as_str()))
         .map(|tokens| TidalClient::new(tokens.access_token));
+    let (mut playback_tokens, mut playback_warning) = match PlaybackTokenStore.load() {
+        Ok(tokens) => (tokens, None),
+        Err(error) => (
+            None,
+            Some(format!("Could not load playback login: {error}")),
+        ),
+    };
+    if let Some(stored) = playback_tokens
+        .as_ref()
+        .filter(|token| token.expires_soon())
+    {
+        match high_tide_auth::refresh(stored) {
+            Ok(updated) => {
+                PlaybackTokenStore.save(&updated)?;
+                playback_tokens = Some(updated);
+            }
+            Err(error) => {
+                playback_warning = Some(format!("Playback login expired: {error}"));
+                playback_tokens = None;
+            }
+        }
+    }
+    let playback_client = playback_tokens.map(|tokens| TidalClient::new(tokens.access_token));
     let mut artwork = if cli.no_images {
         Some(ArtworkState::halfblocks())
     } else {
@@ -106,10 +134,20 @@ async fn main() -> Result<()> {
             Err(error) => app.playback_failed(format!("Could not load For You: {error}")),
         }
     }
+    if let Some(warning) = playback_warning {
+        app.status = warning;
+    }
     update_artwork(tidal.as_ref(), app.selected(), artwork.as_mut()).await;
 
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, &mut app, artwork.as_mut(), tidal.as_ref()).await;
+    let result = run_app(
+        &mut terminal,
+        &mut app,
+        artwork.as_mut(),
+        tidal.as_ref(),
+        playback_client.as_ref(),
+    )
+    .await;
     ratatui::restore();
     result
 }
@@ -153,17 +191,43 @@ async fn run_command(command: Command) -> Result<()> {
             println!("TIDAL authorization stored securely in the OS credential store");
         }
         Command::Auth {
+            action: AuthAction::LoginPlayback,
+        } => {
+            let tokens = high_tide_auth::login().await?;
+            PlaybackTokenStore.save(&tokens)?;
+            println!("Playback authorization stored in the OS credential store");
+        }
+        Command::Auth {
             action: AuthAction::Status,
-        } => match TokenStore.load() {
-            Ok(Some(_)) => println!("Authenticated token present in OS credential store"),
-            Ok(None) => println!("Not authenticated"),
-            Err(error) => println!("Credential status unavailable: {error}"),
-        },
+        } => {
+            println!(
+                "Catalog authorization: {}",
+                if TokenStore.load()?.is_some() {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
+            println!(
+                "Playback authorization: {}",
+                if PlaybackTokenStore.load()?.is_some() {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
+        }
         Command::Auth {
             action: AuthAction::Logout,
         } => {
             TokenStore.clear()?;
-            println!("Stored TIDAL authorization removed");
+            println!("Stored catalog authorization removed");
+        }
+        Command::Auth {
+            action: AuthAction::LogoutPlayback,
+        } => {
+            PlaybackTokenStore.clear()?;
+            println!("Stored playback authorization removed");
         }
     }
     Ok(())
@@ -255,8 +319,25 @@ async fn run_doctor() -> Result<()> {
         .chain(search_items.iter())
         .find(|item| item.kind == MediaKind::Track)
     {
-        match client.unofficial_full_track(&track.id).await {
-            Ok(_) => println!("✓ private full-track playback manifest"),
+        let playback_check = async {
+            let tokens = PlaybackTokenStore
+                .load()?
+                .context("run `tidalbar auth login-playback`")?;
+            let tokens = if tokens.expires_soon() {
+                let updated = high_tide_auth::refresh(&tokens)?;
+                PlaybackTokenStore.save(&updated)?;
+                updated
+            } else {
+                tokens
+            };
+            TidalClient::new(tokens.access_token)
+                .unofficial_full_track(&track.id)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        .await;
+        match playback_check {
+            Ok(_) => println!("✓ private full-track playback manifest (FULL)"),
             Err(error) => {
                 println!("✗ private full-track playback manifest: {error}");
                 failures.push("private full-track playback manifest");
@@ -277,8 +358,8 @@ async fn run_app(
     app: &mut App,
     mut artwork: Option<&mut ArtworkState>,
     tidal: Option<&TidalClient>,
+    playback: Option<&TidalClient>,
 ) -> Result<()> {
-    let resolver = PreviewResolver;
     let mut player = MpvEngine::new();
 
     terminal.draw(|frame| ui::draw(frame, app, artwork.as_deref_mut()))?;
@@ -329,12 +410,16 @@ async fn run_app(
             }
             Action::Play(item) => match item.kind {
                 MediaKind::Track => {
-                    let resource = match tidal {
-                        Some(client) => client
+                    let resource = match (tidal, playback) {
+                        (Some(_), Some(playback)) => playback
                             .unofficial_full_track(&item.id)
                             .await
                             .map_err(|error| error.to_string()),
-                        None => resolver.resolve(&item).map_err(|error| error.to_string()),
+                        (None, _) => Err("Run `tidalbar auth login` for catalog access".to_owned()),
+                        (_, None) => {
+                            Err("Run `tidalbar auth login-playback` for full-track playback"
+                                .to_owned())
+                        }
                     };
                     match resource {
                         Ok(resource) => match player.play(&resource) {

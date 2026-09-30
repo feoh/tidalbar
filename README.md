@@ -6,9 +6,9 @@ Rust and [Ratatui](https://ratatui.rs).
 > [!IMPORTANT]
 > tidalbar is an independent, early-stage project and is not affiliated with or
 > endorsed by TIDAL. Full-track playback uses the undocumented API used by High
-> Tide's `tidalapi` dependency. TIDAL does not support this integration; it may
-> refuse developer-app tokens or stop working without notice. No DRM bypass is
-> implemented.
+> Tide's `tidalapi` dependency. Playback requires a separate login using the
+> installed Python `tidalapi` package; TIDAL can change or withdraw this
+> unsupported integration without notice. No DRM bypass is implemented.
 
 ## Screenshots
 
@@ -37,9 +37,10 @@ The initial application shell is usable and includes:
 - Keyboard navigation and search input
 - Automatic Kitty, iTerm2, Sixel, or Unicode half-block artwork selection
 - A replaceable media-resolver and audio-engine boundary
-- Persistent local playback through `mpv` for unencrypted full-track BTS streams
-  from the unsupported private API (subject to account/API authorization)
-- Secure OAuth PKCE login, refresh, and OS credential-store persistence
+- Persistent local playback through `mpv` for unencrypted full-track BTS and DASH
+  streams from the unsupported private API (subject to account/API authorization)
+- Separate PKCE logins for the official catalog and High Tide-compatible playback,
+  with tokens stored in the OS credential store
 - Official search, collection, playlist, recommendation-mix, and artwork API
   integration; private full-track playback requests
 - Album, artist, and playlist drill-down with back navigation
@@ -54,7 +55,9 @@ remain under active development.
 - Rust 1.88 or newer when building from source
 - [`mpv`](https://mpv.io/) available on `PATH`
 - A TIDAL subscription for subscriber-only API features
-- A TIDAL developer application for API access
+- A TIDAL developer application for catalog API access
+- Python 3 with the unofficial `tidalapi` package available to that Python
+  interpreter for the separate playback login and token refresh
 
 ## Build and run
 
@@ -77,6 +80,7 @@ cargo run -- config path
 cargo run -- config set-client-id YOUR_PUBLIC_CLIENT_ID
 cargo run -- config set-redirect-uri http://127.0.0.1:47831/oauth/callback
 cargo run -- auth login
+cargo run -- auth login-playback
 cargo run -- auth status
 cargo run -- doctor
 ```
@@ -103,9 +107,12 @@ cargo run -- doctor
 ## Configuration and secrets
 
 The public TIDAL client ID and exact registered redirect URI may be placed in
-`config.toml`. OAuth access and refresh tokens are stored in the operating
-system credential store rather than that file. tidalbar does not require,
-store, or distribute a client secret.
+`config.toml` for official catalog access. Playback uses a **separate** OAuth
+session through the installed `tidalapi` package's High Tide-compatible PKCE
+flow. Its client identity stays in that external package: tidalbar does not
+copy High Tide's saved tokens or distribute its client credentials. Both
+sessions' access and refresh tokens are kept separately in the OS credential
+store, not in `config.toml`.
 
 Register the same loopback URI in the TIDAL developer dashboard before running
 `tidalbar auth login`. The current callback listener accepts HTTP loopback URIs
@@ -126,17 +133,32 @@ Playback is split into two interfaces:
 
 Authenticated tracks now request `api.tidal.com/v1/tracks/{id}/playbackinfopostpaywall`
 with `assetpresentation=FULL` and `audioquality=HIGH` (the default in High
-Tide's `tidalapi` dependency), as High Tide's unofficial
-`tidalapi` client does. tidalbar fetches the account's country code from the
-official `/users/me` endpoint and plays only HTTPS URLs from unencrypted BTS
-manifests. MPD and encrypted manifests are not supported. Authenticated playback
-never falls back to an official preview; unsupported tracks report an error.
+Tide's `tidalapi` dependency). The request uses the separate playback login;
+tidalbar gets the session ID and country code from the private `/sessions`
+endpoint, as `tidalapi` does, and plays only HTTPS media from unencrypted BTS
+or DASH/MPD manifests. It checks that TIDAL actually returned `FULL` rather
+than a downgraded `PREVIEW`. Encrypted or unsafe manifests report an error.
 
-This is **not** a supported TIDAL integration. In particular, tidalbar's
-existing developer-app OAuth token may be rejected by the private API: High
-Tide authenticates through a different client flow. `tidalbar doctor` reports
-this failure without printing stream URLs. No third-party client credentials or
-DRM workarounds are included. TIDAL can change this endpoint at any time.
+This is **not** a supported TIDAL integration. The developer-app OAuth token
+previously received `PREVIEW`/`LOW` even when the request asked for `FULL`/`HIGH`;
+a successful HTTP response alone did not prove full playback. `tidalbar doctor`
+now verifies the returned presentation without printing stream URLs. To set up
+playback, install the `tidalapi` package in Python 3, run
+`tidalbar auth login-playback`, and complete its browser redirect prompt locally.
+The playback login does not change your catalog login. If your default Python
+lacks `tidalapi`, install it in a separate environment using `uv` and point
+`TIDALBAR_PYTHON` at that environment's Python executable. For example, on
+Linux or macOS:
+
+```console
+uv venv ~/.local/share/tidalbar/python
+uv pip install --python ~/.local/share/tidalbar/python/bin/python 'tidalapi==0.8.8'
+export TIDALBAR_PYTHON="$HOME/.local/share/tidalbar/python/bin/python"
+tidalbar auth login-playback
+```
+
+No DRM workarounds are included, and TIDAL may still reject full playback for
+an account or track.
 
 ## Development
 

@@ -1,6 +1,6 @@
 [package]
 name = "tidalbar"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A keyboard-driven terminal client for TIDAL"
@@ -32,8 +32,10 @@ reqwest = { version = "0.12.28", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
+roxmltree = "0.20"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+tempfile = "3.25"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = [
   "io-util",
