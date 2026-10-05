@@ -29,3 +29,8 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
+
+## Releases
+
+Follow `docs/RELEASING.md` to cut a release: version bump, CI, annotated tag,
+`gh release create`, and verification of the attached binaries.

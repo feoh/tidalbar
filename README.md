@@ -91,7 +91,7 @@ from their tagged commits. To attach binaries to an existing release, run it
 manually with a version tag, or leave the tag blank to use the latest release:
 
 ```console
-gh workflow run release.yml -f tag=v0.1.2
+gh workflow run release.yml -f tag=v0.1.3
 ```
 
 ## Build and run
