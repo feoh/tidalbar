@@ -45,10 +45,12 @@ The initial application shell is usable and includes:
   integration; private full-track playback requests
 - Album, artist, and playlist drill-down with back navigation
 - Song-list playback with automatic advancement, shuffle, and next-song controls
+- A live progress bar with elapsed and total time
+- Liking and unliking songs, with a heart in player focus for liked songs
 - Configuration in the platform-standard user configuration directory
 
 Placeholder content is shown when tidalbar is not authenticated. Pagination,
-queue management, richer recommendation shelves, and collection mutations
+queue management, richer recommendation shelves, and other collection mutations
 remain under active development.
 
 ## Requirements
@@ -137,6 +139,7 @@ cargo run -- doctor
 | `s` | Toggle displayed song shuffle (also available in sidebar and player focus) |
 | `S` | Start the current song list in random order, enabling shuffle |
 | `n` | Play the next queued song |
+| `L` | Like or unlike the playing song (or the highlighted song when idle) |
 | `f` | Toggle the large-art player focus view |
 | `q` | Quit (or close help when help is open) |
 
@@ -166,6 +169,18 @@ Browsing, searching, and going back do not change the active queue. Playing
 another song or using `S` replaces it. The shuffle setting lasts for the current
 application session. Queues include only loaded songs; API pagination is not yet
 implemented.
+
+### Liked songs
+
+`L` adds the playing song to your TIDAL **Liked tracks**, or removes it if it is
+already liked. When nothing is playing, it uses the highlighted song. Player
+focus shows a ♥ next to the title of a liked song.
+
+Liking uses the official `userCollectionTracks` API with the **playback login**,
+because the catalog login is limited to read-only scopes. Run
+`tidalbar auth login-playback` first. At startup, tidalbar loads your liked
+track IDs in the background; until that finishes, `L` likes rather than
+unlikes, which is harmless for a song that is already liked.
 
 ## Configuration and secrets
 

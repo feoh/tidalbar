@@ -12,6 +12,7 @@ use tidalbar::models::{MediaItem, MediaKind, Shelf};
 use tidalbar::playback::{AudioEngine, MpvEngine, PlaybackEvent};
 use tidalbar::tidal::TidalClient;
 use tidalbar::ui;
+use tokio::sync::oneshot::error::TryRecvError;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -314,28 +315,37 @@ async fn run_doctor() -> Result<()> {
         check_items!("playlist drill-down", client.playlist_items(&playlist.id));
     }
 
-    if let Some(track) = collection_tracks
-        .iter()
-        .chain(search_items.iter())
-        .find(|item| item.kind == MediaKind::Track)
-    {
-        let playback_check = async {
-            let tokens = PlaybackTokenStore
-                .load()?
-                .context("run `tidalbar auth login-playback`")?;
-            let tokens = if tokens.expires_soon() {
-                let updated = high_tide_auth::refresh(&tokens)?;
-                PlaybackTokenStore.save(&updated)?;
-                updated
-            } else {
-                tokens
-            };
-            TidalClient::new(tokens.access_token)
-                .unofficial_full_track(&track.id)
-                .await
-                .map_err(anyhow::Error::from)
+    let playback_client = async {
+        let tokens = PlaybackTokenStore
+            .load()?
+            .context("run `tidalbar auth login-playback`")?;
+        let tokens = if tokens.expires_soon() {
+            let updated = high_tide_auth::refresh(&tokens)?;
+            PlaybackTokenStore.save(&updated)?;
+            updated
+        } else {
+            tokens
+        };
+        anyhow::Ok(TidalClient::new(tokens.access_token))
+    }
+    .await;
+    match &playback_client {
+        // Liking uses the playback login, which carries the write scope.
+        Ok(client) => check_items!("liked track IDs", client.liked_track_ids()),
+        Err(error) => {
+            println!("✗ playback login: {error}");
+            failures.push("playback login");
         }
-        .await;
+    }
+
+    if let (Ok(client), Some(track)) = (
+        &playback_client,
+        collection_tracks
+            .iter()
+            .chain(search_items.iter())
+            .find(|item| item.kind == MediaKind::Track),
+    ) {
+        let playback_check = client.unofficial_full_track(&track.id).await;
         match playback_check {
             Ok(_) => println!("✓ private full-track playback manifest (FULL)"),
             Err(error) => {
@@ -361,11 +371,35 @@ async fn run_app(
     playback: Option<&TidalClient>,
 ) -> Result<()> {
     let mut player = MpvEngine::new();
+    let mut liked_tracks = playback.cloned().map(|client| {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = sender.send(client.liked_track_ids().await);
+        });
+        receiver
+    });
 
     terminal.draw(|frame| ui::draw(frame, app, artwork.as_deref_mut()))?;
 
     loop {
         let selected_before = artwork_target(app).map(|item| item.id.clone());
+        let mut liked_changed = false;
+        if let Some(receiver) = liked_tracks.as_mut() {
+            match receiver.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                result => {
+                    match result {
+                        Ok(Ok(ids)) => app.liked_tracks_loaded(ids),
+                        Ok(Err(error)) => {
+                            app.playback_failed(format!("Could not load liked songs: {error}"))
+                        }
+                        Err(_) => {}
+                    }
+                    liked_tracks = None;
+                    liked_changed = true;
+                }
+            }
+        }
         let playback_event = player.poll_event();
         let playback_changed = playback_event.is_some();
         match playback_event {
@@ -381,8 +415,11 @@ async fn run_app(
             }
             None => {}
         }
+        let progress = player.progress();
+        let progress_changed = progress.whole_seconds() != app.progress.whole_seconds();
+        app.progress = progress;
         let input_ready = event::poll(Duration::from_millis(100))?;
-        if !input_ready && !playback_changed {
+        if !input_ready && !playback_changed && !progress_changed && !liked_changed {
             continue;
         }
         let action = if input_ready {
@@ -443,6 +480,13 @@ async fn run_app(
                 MediaKind::Mix | MediaKind::Radio => {
                     app.playback_failed("This item type is not browsable yet");
                 }
+            },
+            Action::SetLiked { track, liked } => match playback {
+                Some(client) => match client.set_track_liked(&track.id, liked).await {
+                    Ok(()) => app.like_saved(&track, liked),
+                    Err(error) => app.playback_failed(format!("Could not update Liked: {error}")),
+                },
+                None => app.playback_failed("Run `tidalbar auth login-playback` to like songs"),
             },
             Action::TogglePause(paused) => {
                 if let Err(error) = player.set_paused(paused) {

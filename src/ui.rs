@@ -10,6 +10,7 @@ use crate::artwork::ArtworkState;
 const ACCENT: Color = Color::Rgb(0, 230, 205);
 const PANEL: Color = Color::Rgb(24, 24, 24);
 const MUTED: Color = Color::Rgb(145, 145, 145);
+const HEART: Color = Color::Rgb(255, 85, 120);
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, mut artwork: Option<&mut ArtworkState>) {
     let area = frame.area();
@@ -237,7 +238,7 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &App) {
         None => ("Nothing playing", "Select a track to play", "Stopped"),
     };
     let controls = if app.now_playing.is_some() {
-        "Space pause/resume"
+        "Space pause/resume  ·  L like"
     } else {
         "Enter open/play"
     };
@@ -259,6 +260,12 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(MUTED),
             ),
         ]),
+        Line::from(
+            [Span::raw(" ")]
+                .into_iter()
+                .chain(progress_line(app, area.width.saturating_sub(2)).spans)
+                .collect::<Vec<_>>(),
+        ),
     ])
     .block(
         Block::default()
@@ -308,7 +315,10 @@ fn render_player_focus(
         );
     }
 
-    let item = app.now_playing.as_ref().or_else(|| app.selected());
+    let item = app.focused_item();
+    let liked = item.is_some_and(|item| {
+        item.kind == crate::models::MediaKind::Track && app.is_liked(&item.id) == Some(true)
+    });
     let (title, subtitle, playback) = match item {
         Some(item) => (
             item.title.as_str(),
@@ -321,13 +331,20 @@ fn render_player_focus(
         ),
         None => ("Nothing playing", "Choose a track to begin", "STOPPED"),
     };
+    let mut title_line = vec![Span::styled(
+        title,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if liked {
+        title_line.push(Span::styled(
+            "  ♥",
+            Style::default().fg(HEART).add_modifier(Modifier::BOLD),
+        ));
+    }
     let details = Paragraph::new(vec![
-        Line::styled(
-            title,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Line::from(title_line),
         Line::styled(subtitle, Style::default().fg(MUTED)),
         Line::default(),
         Line::styled(
@@ -337,6 +354,7 @@ fn render_player_focus(
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
+        progress_line(app, sections[1].width.saturating_sub(2)),
         Line::default(),
         Line::styled(playback_order_label(app), Style::default().fg(ACCENT)),
         Line::styled(app.status.as_str(), Style::default().fg(MUTED)),
@@ -346,6 +364,7 @@ fn render_player_focus(
             Style::default().fg(Color::White),
         ),
         Line::styled("Space  Pause / resume", Style::default().fg(Color::White)),
+        Line::styled("L  Like / unlike", Style::default().fg(Color::White)),
         Line::styled(
             "f / Esc  Return to browser",
             Style::default().fg(Color::White),
@@ -366,6 +385,37 @@ fn render_player_focus(
             .border_style(Style::default().fg(PANEL)),
     );
     frame.render_widget(details, sections[1]);
+}
+
+/// A bar that fills as the song plays, followed by elapsed and total time.
+fn progress_line(app: &App, width: u16) -> Line<'static> {
+    let playing = app.now_playing.is_some();
+    let (position, duration) = app.progress.whole_seconds();
+    let clock = match (playing, duration) {
+        (false, _) => " --:-- / --:--".to_owned(),
+        (true, 0) => format!(" {} / --:--", format_clock(position)),
+        (true, _) => format!(" {} / {}", format_clock(position), format_clock(duration)),
+    };
+    let bar_width = usize::from(width).saturating_sub(clock.chars().count());
+    let ratio = if playing { app.progress.ratio() } else { 0.0 };
+    let filled = ((ratio * bar_width as f64).round() as usize).min(bar_width);
+    Line::from(vec![
+        Span::styled("━".repeat(filled), Style::default().fg(ACCENT)),
+        Span::styled(
+            "─".repeat(bar_width - filled),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(clock, Style::default().fg(MUTED)),
+    ])
+}
+
+fn format_clock(seconds: u64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 fn playback_order_label(app: &App) -> String {
@@ -415,6 +465,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  Space             Pause or resume"),
         Line::from("  s / S             Toggle displayed shuffle / reshuffle and play"),
         Line::from("  n                 Next song in the captured list"),
+        Line::from("  L                 Like or unlike the playing (or highlighted) song"),
         Line::default(),
         Line::from("  ? / Esc / q       Close this help     q  Quit elsewhere"),
     ])
@@ -621,6 +672,99 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
             Action::Play(selected)
         );
+    }
+
+    fn playing_app() -> App {
+        let mut app = App::new(true);
+        app.playback_started(crate::models::MediaItem::new(
+            "1",
+            "Track",
+            "Artist",
+            crate::models::MediaKind::Track,
+        ));
+        app.progress = crate::models::PlaybackProgress {
+            position_seconds: 83.6,
+            duration_seconds: 200.0,
+        };
+        app
+    }
+
+    #[test]
+    fn progress_bar_shows_elapsed_and_total_time_in_browser_and_player_focus() {
+        for width in [60, 100, 140] {
+            let mut app = playing_app();
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("test terminal");
+            for focused in [false, true] {
+                app.player_focused = focused;
+                terminal
+                    .draw(|frame| draw(frame, &app, None))
+                    .expect("draw");
+                let text = rendered_text(terminal.backend().buffer());
+                assert!(
+                    text.contains("1:23 / 3:20"),
+                    "width {width} focus {focused}"
+                );
+                assert!(text.contains('━') && text.contains('─'));
+            }
+        }
+    }
+
+    #[test]
+    fn progress_bar_fills_in_proportion_to_elapsed_time() {
+        let app = playing_app();
+        let line = progress_line(&app, 50);
+        let width: usize = line
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+        assert_eq!(width, 50);
+        let filled = line.spans[0].content.chars().count();
+        let empty = line.spans[1].content.chars().count();
+        assert_eq!(filled, ((filled + empty) as f64 * 0.418).round() as usize);
+        assert_eq!(line.spans[2].content, " 1:23 / 3:20");
+    }
+
+    #[test]
+    fn idle_or_unknown_duration_progress_does_not_invent_a_total() {
+        let mut app = App::new(true);
+        app.progress.position_seconds = 12.0;
+        let idle = progress_line(&app, 30);
+        assert_eq!(idle.spans[0].content, "");
+        assert_eq!(idle.spans[2].content, " --:-- / --:--");
+        let mut app = playing_app();
+        app.progress.duration_seconds = 0.0;
+        assert_eq!(progress_line(&app, 30).spans[2].content, " 1:23 / --:--");
+        assert_eq!(format_clock(3_725), "1:02:05");
+        assert_eq!(format_clock(59), "0:59");
+    }
+
+    #[test]
+    fn player_focus_shows_a_heart_only_for_liked_songs() {
+        let mut app = playing_app();
+        app.player_focused = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        for (liked, ids) in [(false, vec![]), (true, vec!["1".to_owned()])] {
+            app.liked_tracks_loaded(ids.into_iter().collect());
+            terminal
+                .draw(|frame| draw(frame, &app, None))
+                .expect("draw");
+            let text = rendered_text(terminal.backend().buffer());
+            assert_eq!(text.contains('♥'), liked);
+            assert!(text.contains("Like / unlike"));
+        }
+    }
+
+    #[test]
+    fn help_advertises_liking() {
+        let mut app = App::new(true);
+        app.help_visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, None))
+            .expect("draw");
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("Like or unlike the playing (or highlighted) song"));
     }
 
     #[test]

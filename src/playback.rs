@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tempfile::{Builder, NamedTempFile};
 use thiserror::Error;
 
-use crate::models::MediaItem;
+use crate::models::{MediaItem, PlaybackProgress};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioQuality {
@@ -83,6 +83,9 @@ pub trait AudioEngine {
     fn poll_event(&mut self) -> Option<PlaybackEvent> {
         None
     }
+    fn progress(&self) -> PlaybackProgress {
+        PlaybackProgress::default()
+    }
 }
 
 #[derive(Default)]
@@ -92,6 +95,7 @@ pub struct MpvEngine {
     ipc_path: Option<String>,
     events: Option<Receiver<Value>>,
     playback_events: PlaybackEvents,
+    progress: PlaybackProgress,
     next_request_id: u64,
     // Keep the current manifest until mpv has finished loading it. Keep the
     // previous one until a later play, since IPC writes do not await loadfile.
@@ -147,6 +151,9 @@ impl MpvEngine {
                     self.ipc = Some(ipc);
                     self.events = Some(events);
                     self.ipc_path = Some(ipc_path);
+                    for command in observe_commands() {
+                        self.command(command)?;
+                    }
                     return Ok(());
                 }
                 Err(error) => last_error = error,
@@ -197,6 +204,7 @@ impl MpvEngine {
         self.ipc = None;
         self.events = None;
         self.playback_events = PlaybackEvents::default();
+        self.progress = PlaybackProgress::default();
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
@@ -224,6 +232,12 @@ impl AudioEngine for MpvEngine {
             _ => unreachable!("DASH manifest must have been staged"),
         };
         self.ensure_started()?;
+        // Queued positions belong to the replaced track; none of the queued
+        // replies or end-file events can match the new load either.
+        if let Some(events) = self.events.as_ref() {
+            while events.try_recv().is_ok() {}
+        }
+        self.progress = PlaybackProgress::default();
         self.next_request_id += 2;
         let request_id = self.next_request_id;
         self.playback_events = PlaybackEvents::new(request_id);
@@ -249,6 +263,9 @@ impl AudioEngine for MpvEngine {
         loop {
             match events.try_recv() {
                 Ok(message) => {
+                    if apply_progress(&mut self.progress, &message) {
+                        continue;
+                    }
                     if let Some(event) = self.playback_events.accept(&message) {
                         return Some(event);
                     }
@@ -263,8 +280,13 @@ impl AudioEngine for MpvEngine {
         }
     }
 
+    fn progress(&self) -> PlaybackProgress {
+        self.progress
+    }
+
     fn stop(&mut self) -> Result<(), PlaybackError> {
         self.playback_events = PlaybackEvents::default();
+        self.progress = PlaybackProgress::default();
         if self.child.is_none() {
             return Ok(());
         }
@@ -291,6 +313,31 @@ fn stage_manifest(xml: &str) -> Result<NamedTempFile, PlaybackError> {
         .map_err(PlaybackError::Manifest)?;
     file.flush().map_err(PlaybackError::Manifest)?;
     Ok(file)
+}
+
+const OBSERVED_PROPERTIES: [&str; 2] = ["time-pos", "duration"];
+
+fn observe_commands() -> Vec<Value> {
+    OBSERVED_PROPERTIES
+        .iter()
+        .zip(1..)
+        .map(|(property, id)| json!(["observe_property", id, property]))
+        .collect()
+}
+
+/// Returns whether the message was a position update. mpv reports an
+/// unavailable property (for example between tracks) as null.
+fn apply_progress(progress: &mut PlaybackProgress, message: &Value) -> bool {
+    if message["event"] != "property-change" {
+        return false;
+    }
+    let value = message["data"].as_f64().unwrap_or_default();
+    match message["name"].as_str() {
+        Some("time-pos") => progress.position_seconds = value,
+        Some("duration") => progress.duration_seconds = value,
+        _ => return false,
+    }
+    true
 }
 
 fn command_payload(command: Value) -> Result<Vec<u8>, serde_json::Error> {
@@ -351,7 +398,11 @@ fn read_responses(reader: impl Read + Send + 'static) -> Receiver<Value> {
                 continue;
             };
             // Ignore unrelated metadata and never log IPC payloads/stream URLs.
-            if (message.get("request_id").is_some() || message["event"] == "end-file")
+            let observed = message["event"] == "property-change"
+                && message["name"]
+                    .as_str()
+                    .is_some_and(|name| OBSERVED_PROPERTIES.contains(&name));
+            if (message.get("request_id").is_some() || message["event"] == "end-file" || observed)
                 && sender.send(message).is_err()
             {
                 break;
@@ -577,13 +628,90 @@ mod tests {
         let input = std::io::Cursor::new(concat!(
             "not json\n",
             "{\"event\":\"file-loaded\"}\n",
+            "{\"event\":\"property-change\",\"name\":\"metadata\",\"data\":{}}\n",
             "{\"request_id\":3,\"error\":\"success\",\"data\":7}\n",
+            "{\"event\":\"property-change\",\"id\":1,\"name\":\"time-pos\",\"data\":1.5}\n",
             "{\"event\":\"end-file\",\"playlist_entry_id\":7,\"reason\":\"eof\"}\n"
         ));
         let messages: Vec<_> = read_responses(input).iter().collect();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["request_id"], 3);
-        assert_eq!(messages[1], end(7, "eof"));
+        assert_eq!(messages[1]["name"], "time-pos");
+        assert_eq!(messages[2], end(7, "eof"));
+    }
+
+    fn property(name: &str, data: Value) -> Value {
+        json!({"event": "property-change", "name": name, "data": data})
+    }
+
+    #[test]
+    fn position_and_duration_updates_track_progress_and_null_clears_it() {
+        let mut progress = PlaybackProgress::default();
+        assert!(apply_progress(
+            &mut progress,
+            &property("time-pos", json!(30.0))
+        ));
+        assert!(apply_progress(
+            &mut progress,
+            &property("duration", json!(120.0))
+        ));
+        assert_eq!(progress.ratio(), 0.25);
+        assert_eq!(progress.whole_seconds(), (30, 120));
+        assert!(apply_progress(
+            &mut progress,
+            &property("time-pos", Value::Null)
+        ));
+        assert_eq!(progress.position_seconds, 0.0);
+        assert!(!apply_progress(
+            &mut progress,
+            &property("pause", json!(true))
+        ));
+        assert!(!apply_progress(&mut progress, &end(1, "eof")));
+    }
+
+    #[test]
+    fn progress_ratio_is_clamped_and_unknown_duration_is_empty() {
+        let progress = PlaybackProgress {
+            position_seconds: 50.0,
+            duration_seconds: 10.0,
+        };
+        assert_eq!(progress.ratio(), 1.0);
+        assert_eq!(PlaybackProgress::default().ratio(), 0.0);
+    }
+
+    #[test]
+    fn polling_applies_progress_without_hiding_completion_events() {
+        let (sender, receiver) = mpsc::channel();
+        let mut engine = MpvEngine::new();
+        engine.events = Some(receiver);
+        engine.playback_events = PlaybackEvents::new(2);
+        for message in [
+            entry_reply(2, 5),
+            property("duration", json!(200.0)),
+            property("time-pos", json!(199.5)),
+            end(5, "eof"),
+            property("time-pos", Value::Null),
+        ] {
+            sender.send(message).expect("send");
+        }
+        assert_eq!(engine.poll_event(), Some(PlaybackEvent::Finished));
+        assert_eq!(engine.progress().whole_seconds(), (199, 200));
+        assert_eq!(engine.poll_event(), None);
+        assert_eq!(engine.progress().position_seconds, 0.0);
+        engine.events = None;
+        assert_eq!(engine.stop().ok(), Some(()));
+        assert_eq!(engine.progress(), PlaybackProgress::default());
+    }
+
+    #[test]
+    fn mpv_observes_only_position_and_duration() {
+        assert_eq!(
+            observe_commands(),
+            [
+                json!(["observe_property", 1, "time-pos"]),
+                json!(["observe_property", 2, "duration"])
+            ]
+        );
     }
 
     #[test]

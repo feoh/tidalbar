@@ -36,6 +36,29 @@ impl MediaItem {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlaybackProgress {
+    pub position_seconds: f64,
+    pub duration_seconds: f64,
+}
+
+impl PlaybackProgress {
+    pub fn ratio(&self) -> f64 {
+        if self.duration_seconds <= 0.0 {
+            return 0.0;
+        }
+        (self.position_seconds / self.duration_seconds).clamp(0.0, 1.0)
+    }
+
+    /// Whole-second positions; the UI only redraws when these change.
+    pub fn whole_seconds(&self) -> (u64, u64) {
+        (
+            self.position_seconds.max(0.0) as u64,
+            self.duration_seconds.max(0.0) as u64,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Shelf {
     pub title: String,

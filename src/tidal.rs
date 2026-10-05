@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
 use reqwest::StatusCode;
@@ -13,6 +13,9 @@ use crate::playback::{AudioQuality, PlayableResource, PlayableSource};
 const API_BASE: &str = "https://openapi.tidal.com/v2";
 const PRIVATE_API_BASE: &str = "https://api.tidal.com/v1";
 const JSON_API: &str = "application/vnd.api+json";
+const LIKED_TRACKS: [&str; 4] = ["userCollectionTracks", "me", "relationships", "items"];
+// TIDAL pages collections 20 items at a time; this bounds a misbehaving cursor.
+const MAX_COLLECTION_PAGES: usize = 1_000;
 
 #[derive(Debug, Error)]
 pub enum TidalError {
@@ -124,6 +127,53 @@ impl TidalClient {
             )
             .await?;
         Ok(items_from_document(&document, None))
+    }
+
+    /// Every liked track ID, following the official collection cursor.
+    pub async fn liked_track_ids(&self) -> Result<HashSet<String>, TidalError> {
+        let mut ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_COLLECTION_PAGES {
+            let query = cursor
+                .as_deref()
+                .map(|cursor| vec![("page[cursor]", cursor)])
+                .unwrap_or_default();
+            let document = self.get(&LIKED_TRACKS, &query).await?;
+            ids.extend(
+                identifiers(document.get("data"))
+                    .into_iter()
+                    .filter(|(kind, _)| kind == "tracks")
+                    .map(|(_, id)| id),
+            );
+            match next_cursor(&document) {
+                Some(next) if cursor.as_deref() != Some(next) => cursor = Some(next.to_owned()),
+                _ => return Ok(ids),
+            }
+        }
+        Err(TidalError::InvalidResponse(
+            "liked-track pagination did not finish".to_owned(),
+        ))
+    }
+
+    pub async fn set_track_liked(&self, track_id: &str, liked: bool) -> Result<(), TidalError> {
+        let method = if liked {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::DELETE
+        };
+        let body = serde_json::json!({"data": [{"type": "tracks", "id": track_id}]});
+        let response = self
+            .http
+            .request(method, api_url(&LIKED_TRACKS, &[])?)
+            .bearer_auth(&self.access_token)
+            .header(reqwest::header::ACCEPT, JSON_API)
+            .header(reqwest::header::CONTENT_TYPE, JSON_API)
+            .body(body.to_string())
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        write_result(status, &bytes, liked)
     }
 
     pub async fn collection_albums(&self) -> Result<Vec<MediaItem>, TidalError> {
@@ -288,19 +338,9 @@ impl TidalClient {
     }
 
     async fn get(&self, segments: &[&str], query: &[(&str, &str)]) -> Result<Value, TidalError> {
-        let mut url =
-            Url::parse(API_BASE).map_err(|error| TidalError::InvalidResponse(error.to_string()))?;
-        {
-            let mut path = url
-                .path_segments_mut()
-                .map_err(|()| TidalError::InvalidResponse("invalid API base URL".to_owned()))?;
-            path.extend(segments);
-        }
-        url.query_pairs_mut().extend_pairs(query.iter().copied());
-
         let response = self
             .http
-            .get(url)
+            .get(api_url(segments, query)?)
             .bearer_auth(&self.access_token)
             .header(reqwest::header::ACCEPT, JSON_API)
             .send()
@@ -309,6 +349,50 @@ impl TidalClient {
         let bytes = response.bytes().await?;
         decode_response(status, &bytes)
     }
+}
+
+fn api_url(segments: &[&str], query: &[(&str, &str)]) -> Result<Url, TidalError> {
+    let mut url =
+        Url::parse(API_BASE).map_err(|error| TidalError::InvalidResponse(error.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|()| TidalError::InvalidResponse("invalid API base URL".to_owned()))?
+        .extend(segments);
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query.iter().copied());
+    }
+    Ok(url)
+}
+
+fn next_cursor(document: &Value) -> Option<&str> {
+    document
+        .get("links")
+        .and_then(|links| links.get("meta"))
+        .and_then(|meta| meta.get("nextCursor"))
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
+}
+
+/// Collection writes may answer with an empty body. Liking an already-liked
+/// track is the state the user asked for, not a failure.
+fn write_result(status: StatusCode, bytes: &[u8], liked: bool) -> Result<(), TidalError> {
+    if status.is_success() {
+        return Ok(());
+    }
+    let error = decode_response(status, bytes).expect_err("unsuccessful status");
+    let duplicate = serde_json::from_slice::<Value>(bytes).is_ok_and(|document| {
+        document
+            .get("errors")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|error| {
+                error.get("code").and_then(Value::as_str) == Some("DUPLICATE_ITEMS_IN_COLLECTION")
+            })
+    });
+    if liked && status == StatusCode::CONFLICT && duplicate {
+        return Ok(());
+    }
+    Err(error)
 }
 
 fn private_url(segments: &[&str], query: &[(&str, &str)]) -> Result<Url, TidalError> {
@@ -826,6 +910,47 @@ mod tests {
             items[0].artwork_url.as_deref(),
             Some("https://example.com/cover.jpg")
         );
+    }
+
+    #[test]
+    fn liked_track_pages_follow_the_meta_cursor_until_it_is_absent() {
+        let page = json!({
+            "data": [{"type": "tracks", "id": "1"}, {"type": "videos", "id": "2"}],
+            "links": {"next": "/userCollectionTracks/me/relationships/items?page%5Bcursor%5D=20", "meta": {"nextCursor": "20"}}
+        });
+        assert_eq!(next_cursor(&page), Some("20"));
+        assert_eq!(
+            next_cursor(&json!({"data": [], "links": {"self": "/"}})),
+            None
+        );
+        assert_eq!(
+            next_cursor(&json!({"links": {"meta": {"nextCursor": ""}}})),
+            None
+        );
+    }
+
+    #[test]
+    fn collection_url_encodes_the_cursor_and_omits_an_empty_query() {
+        let url = api_url(&LIKED_TRACKS, &[]).expect("url");
+        assert_eq!(
+            url.as_str(),
+            "https://openapi.tidal.com/v2/userCollectionTracks/me/relationships/items"
+        );
+        let url = api_url(&LIKED_TRACKS, &[("page[cursor]", "a&b")]).expect("url");
+        assert_eq!(url.query(), Some("page%5Bcursor%5D=a%26b"));
+    }
+
+    #[test]
+    fn collection_writes_accept_empty_success_and_duplicate_likes_only() {
+        assert!(write_result(StatusCode::NO_CONTENT, b"", true).is_ok());
+        assert!(write_result(StatusCode::OK, b"{}", false).is_ok());
+        let duplicate = br#"{"errors":[{"code":"DUPLICATE_ITEMS_IN_COLLECTION","status":"409"}]}"#;
+        assert!(write_result(StatusCode::CONFLICT, duplicate, true).is_ok());
+        assert!(write_result(StatusCode::CONFLICT, duplicate, false).is_err());
+        let full = br#"{"errors":[{"code":"TOO_MANY_ITEMS_IN_COLLECTION","detail":"Collection item limit reached","status":"409"}]}"#;
+        let error = write_result(StatusCode::CONFLICT, full, true).expect_err("limit");
+        assert!(error.to_string().contains("Collection item limit reached"));
+        assert!(write_result(StatusCode::FORBIDDEN, b"", true).is_err());
     }
 
     #[test]

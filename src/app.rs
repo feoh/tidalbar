@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
-use crate::models::{MediaItem, MediaKind, Shelf, demo_home};
+use crate::models::{MediaItem, MediaKind, PlaybackProgress, Shelf, demo_home};
 use crate::queue::PlaybackQueue;
 use crate::song_list::SongListOrder;
 
@@ -44,6 +46,7 @@ pub enum Action {
     Play(MediaItem),
     Quit,
     Search(String),
+    SetLiked { track: MediaItem, liked: bool },
     TogglePause(bool),
 }
 
@@ -74,6 +77,11 @@ pub struct App {
     pub shuffle: bool,
     pub queue: PlaybackQueue,
     pub status: String,
+    pub progress: PlaybackProgress,
+    /// `None` until the collection has been loaded.
+    liked_tracks: Option<HashSet<String>>,
+    /// Likes changed while the collection was still loading.
+    liked_changes: HashMap<String, bool>,
     history: Vec<ViewState>,
     list_orders: Vec<SongListOrder>,
     selection_explicit: bool,
@@ -104,6 +112,9 @@ impl App {
             shuffle: false,
             queue: PlaybackQueue::default(),
             status: status.to_owned(),
+            progress: PlaybackProgress::default(),
+            liked_tracks: None,
+            liked_changes: HashMap::new(),
             history: Vec::new(),
             list_orders,
             selection_explicit: false,
@@ -157,6 +168,9 @@ impl App {
         }
         if key.code == KeyCode::Char('n') {
             return self.next_track();
+        }
+        if key.code == KeyCode::Char('L') {
+            return self.toggle_like();
         }
         if self.player_focused && !matches!(key.code, KeyCode::Char('q') | KeyCode::Char(' ')) {
             return Action::None;
@@ -377,6 +391,65 @@ impl App {
             "Shuffle on · Enter plays highlighted song"
         }
         .to_owned();
+    }
+
+    /// The song shown in player focus: what is playing, else the highlight.
+    pub fn focused_item(&self) -> Option<&MediaItem> {
+        self.now_playing.as_ref().or_else(|| self.selected())
+    }
+
+    /// `None` while the liked-track collection is unknown.
+    pub fn is_liked(&self, track_id: &str) -> Option<bool> {
+        if let Some(liked) = self.liked_changes.get(track_id) {
+            return Some(*liked);
+        }
+        self.liked_tracks
+            .as_ref()
+            .map(|tracks| tracks.contains(track_id))
+    }
+
+    pub fn liked_tracks_loaded(&mut self, mut tracks: HashSet<String>) {
+        for (id, liked) in self.liked_changes.drain() {
+            if liked {
+                tracks.insert(id);
+            } else {
+                tracks.remove(&id);
+            }
+        }
+        self.liked_tracks = Some(tracks);
+    }
+
+    pub fn like_saved(&mut self, track: &MediaItem, liked: bool) {
+        match self.liked_tracks.as_mut() {
+            Some(tracks) if liked => {
+                tracks.insert(track.id.clone());
+            }
+            Some(tracks) => {
+                tracks.remove(&track.id);
+            }
+            None => {
+                self.liked_changes.insert(track.id.clone(), liked);
+            }
+        }
+        self.status = if liked {
+            format!("♥ Liked · {}", track.title)
+        } else {
+            format!("Removed from Liked · {}", track.title)
+        };
+    }
+
+    fn toggle_like(&mut self) -> Action {
+        let Some(track) = self
+            .focused_item()
+            .filter(|item| item.kind == MediaKind::Track)
+            .cloned()
+        else {
+            self.status = "Play or highlight a song to like it".to_owned();
+            return Action::None;
+        };
+        // An unknown state likes: adding an already-liked song is harmless.
+        let liked = self.is_liked(&track.id) != Some(true);
+        Action::SetLiked { track, liked }
     }
 
     pub fn playback_started(&mut self, item: MediaItem) {
@@ -1023,6 +1096,93 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::Play(only_song));
         assert_eq!(app.queue.progress(), Some((1, 1)));
         assert_eq!(app.playback_finished(), Action::None);
+    }
+
+    fn like_action(app: &mut App) -> Action {
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT))
+    }
+
+    #[test]
+    fn like_toggles_the_playing_song_before_the_highlighted_one() {
+        let mut app = App::new(true);
+        app.open_items("Songs", songs());
+        let playing = songs()[3].clone();
+        app.playback_started(playing.clone());
+        app.liked_tracks_loaded(HashSet::from(["3".to_owned()]));
+        assert_eq!(
+            like_action(&mut app),
+            Action::SetLiked {
+                track: playing.clone(),
+                liked: false
+            }
+        );
+        app.like_saved(&playing, false);
+        assert_eq!(app.is_liked("3"), Some(false));
+        assert_eq!(app.status, "Removed from Liked · Song 3");
+        assert_eq!(
+            like_action(&mut app),
+            Action::SetLiked {
+                track: playing.clone(),
+                liked: true
+            }
+        );
+        app.like_saved(&playing, true);
+        assert_eq!(app.is_liked("3"), Some(true));
+        assert_eq!(app.status, "♥ Liked · Song 3");
+    }
+
+    #[test]
+    fn like_targets_the_highlighted_song_when_idle_and_rejects_non_songs() {
+        let mut app = App::new(true);
+        app.open_items("Songs", songs());
+        app.selected_item = 2;
+        assert_eq!(
+            like_action(&mut app),
+            Action::SetLiked {
+                track: songs()[2].clone(),
+                liked: true
+            },
+            "an unknown collection likes rather than unlikes"
+        );
+        app.open_items(
+            "Albums",
+            vec![MediaItem::new("a", "Album", "Artist", MediaKind::Album)],
+        );
+        assert_eq!(like_action(&mut app), Action::None);
+        assert!(app.status.contains("highlight a song"));
+    }
+
+    #[test]
+    fn like_works_from_sidebar_and_player_focus_but_not_search_or_help() {
+        let mut app = App::new(true);
+        app.open_items("Songs", songs());
+        app.handle_key(key(KeyCode::Tab));
+        assert!(matches!(like_action(&mut app), Action::SetLiked { .. }));
+        app.handle_key(key(KeyCode::Char('f')));
+        assert!(matches!(like_action(&mut app), Action::SetLiked { .. }));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(like_action(&mut app), Action::None);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(like_action(&mut app), Action::None);
+        assert_eq!(app.search_query, "L");
+    }
+
+    #[test]
+    fn likes_saved_before_the_collection_loads_override_the_stale_snapshot() {
+        let mut app = App::new(true);
+        let liked = songs()[0].clone();
+        let unliked = songs()[1].clone();
+        assert_eq!(app.is_liked("0"), None);
+        app.like_saved(&liked, true);
+        app.like_saved(&unliked, false);
+        assert_eq!(app.is_liked("0"), Some(true));
+        app.liked_tracks_loaded(HashSet::from(["1".to_owned(), "2".to_owned()]));
+        assert_eq!(app.is_liked("0"), Some(true));
+        assert_eq!(app.is_liked("1"), Some(false));
+        assert_eq!(app.is_liked("2"), Some(true));
+        assert_eq!(app.is_liked("5"), Some(false));
     }
 
     #[test]
