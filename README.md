@@ -60,6 +60,38 @@ remain under active development.
 - Python 3 with the unofficial `tidalapi` package available to that Python
   interpreter for the separate playback login and token refresh
 
+## Download a binary
+
+Prebuilt binaries are attached to [GitHub releases](https://github.com/feoh/tidalbar/releases/latest):
+
+| Platform | Archive target |
+| --- | --- |
+| Linux x86-64 (built on Ubuntu 22.04) | `x86_64-unknown-linux-gnu` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
+| Windows x86-64 | `x86_64-pc-windows-msvc` |
+
+Download `tidalbar-<tag>-<target>.tar.gz` (Linux/macOS) or `.zip` (Windows),
+extract it, and place `tidalbar` or `tidalbar.exe` on your `PATH`. Each archive
+includes the README and license, with a separate `.sha256` checksum file.
+On Linux, verify the download before extracting it with
+`sha256sum --check <archive>.sha256`; on macOS use
+`shasum -a 256 --check <archive>.sha256`. On Windows, compare
+`Get-FileHash <archive> -Algorithm SHA256` with the checksum file.
+
+Rust is not needed to run a binary. **mpv and Python with `tidalapi` are still
+separate requirements**; they are not bundled. macOS builds are not Apple-signed
+or notarized. Follow the catalog and playback login instructions below after
+installing.
+
+The `Release binaries` GitHub Actions workflow builds published releases
+from their tagged commits. To attach binaries to an existing release, run it
+manually with a version tag, or leave the tag blank to use the latest release:
+
+```console
+gh workflow run release.yml -f tag=v0.1.2
+```
+
 ## Build and run
 
 ```console

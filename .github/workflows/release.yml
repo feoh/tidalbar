@@ -1,0 +1,179 @@
+---
+name: Release binaries
+
+"on":
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag (blank uses the latest release)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-binaries
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve published release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Resolve release and immutable source commit
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG:-${REQUESTED_TAG:-}}"
+          if [[ -z "$tag" ]]; then
+            tag=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a version tag such as v0.1.2" >&2
+            exit 1
+          fi
+          test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = false
+          object=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq .object)
+          for _ in {1..5}; do
+            type=$(jq -r .type <<< "$object")
+            commit=$(jq -r .sha <<< "$object")
+            if [[ "$type" = commit ]]; then
+              break
+            fi
+            test "$type" = tag
+            object=$(gh api "repos/$GH_REPO/git/tags/$commit" --jq .object)
+          done
+          test "$type" = commit
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+            rustflags: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            suffix: ""
+            rustflags: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: ""
+            rustflags: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: .exe
+            rustflags: "-C target-feature=+crt-static"
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      BINARY_SUFFIX: ${{ matrix.suffix }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      # v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      # stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          targets: ${{ matrix.target }}
+      # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: release-${{ matrix.target }}
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Test release build
+        shell: bash
+        run: >-
+          cargo test --release --locked --all-targets --all-features
+          --target "$TARGET"
+      - name: Smoke test binary and verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/tidalbar$BINARY_SUFFIX"
+          test "$("$binary" --version)" = "tidalbar ${RELEASE_TAG#v}"
+          "$binary" --help > /dev/null
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="tidalbar-$RELEASE_TAG-$TARGET"
+          mkdir -p "dist/$package"
+          cp "target/$TARGET/release/tidalbar" README.md LICENSE "dist/$package/"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
+          rm -rf "dist/$package"
+          cd dist
+          shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256"
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = "tidalbar-${env:RELEASE_TAG}-${env:TARGET}"
+          New-Item -ItemType Directory -Force "dist/$package" | Out-Null
+          Copy-Item "target/$env:TARGET/release/tidalbar.exe", README.md, LICENSE "dist/$package/"
+          Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
+          Remove-Item -Recurse "dist/$package"
+          $hash = (Get-FileHash "dist/$package.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "dist/$package.zip.sha256" -Encoding utf8NoBOM -Value "$hash  $package.zip"
+      # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tidalbar-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attach binaries to release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # v4. No source checkout or execution with the release-writing token.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: tidalbar-*
+          path: artifacts
+          merge-multiple: true
+      - name: Verify checksums and upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum --check ./*.sha256
+          gh release upload "$RELEASE_TAG" ./*.tar.gz ./*.zip ./*.sha256 --clobber
