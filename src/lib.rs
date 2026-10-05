@@ -10,5 +10,7 @@ pub mod config;
 pub mod high_tide_auth;
 pub mod models;
 pub mod playback;
+pub mod queue;
+mod song_list;
 pub mod tidal;
 pub mod ui;

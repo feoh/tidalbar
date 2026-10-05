@@ -44,6 +44,7 @@ The initial application shell is usable and includes:
 - Official search, collection, playlist, recommendation-mix, and artwork API
   integration; private full-track playback requests
 - Album, artist, and playlist drill-down with back navigation
+- Song-list playback with automatic advancement, shuffle, and next-song controls
 - Configuration in the platform-standard user configuration directory
 
 Placeholder content is shown when tidalbar is not authenticated. Pagination,
@@ -101,8 +102,38 @@ cargo run -- doctor
 | `Enter` or `p` | Open albums/artists/playlists or play a track |
 | `Backspace` or `Esc` | Return from a detail view |
 | `Space` | Pause or resume |
+| `s` | Toggle displayed song shuffle (also available in sidebar and player focus) |
+| `S` | Start the current song list in random order, enabling shuffle |
+| `n` | Play the next queued song |
 | `f` | Toggle the large-art player focus view |
 | `q` | Quit (or close help when help is open) |
+
+### Shuffle and song lists
+
+Open a playlist, album, or artist, or select a shelf of songs such as search
+results, liked tracks, or radio results. Press `s` to shuffle the displayed songs,
+then `Enter`/`p` to play the highlighted song. The default highlight moves to a
+random starting song; a song deliberately selected with navigation remains
+highlighted. Playback follows the displayed song order, wrapping to include any
+songs above your starting selection. `S` reshuffles the current list and starts
+playing immediately.
+
+Only songs from the current shelf are queued; albums and other non-song search
+results stay in place and are not queued. New lists also appear shuffled while
+shuffle is on. Turning it off restores each list's original order.
+
+Songs advance automatically when playback ends. Shuffle visits each list entry
+once, then stops; there is no automatic repeat. With shuffle off, `Enter` plays
+from the selected song through the end of the list. Toggling shuffle during
+playback keeps the current song and reorders only the remaining queue; when its
+source list is visible, that queue follows the displayed shuffle. Turning shuffle
+off restores the unplayed songs' original list order. `n` skips to the next queued song. Playback errors stop
+automatic advancement; use `n` to skip the failed song.
+
+Browsing, searching, and going back do not change the active queue. Playing
+another song or using `S` replaces it. The shuffle setting lasts for the current
+application session. Queues include only loaded songs; API pagination is not yet
+implemented.
 
 ## Configuration and secrets
 

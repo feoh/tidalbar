@@ -9,7 +9,7 @@ use tidalbar::auth::{TokenStore, login, refresh};
 use tidalbar::config::{AppConfig, config_path, config_path_display};
 use tidalbar::high_tide_auth::{self, PlaybackTokenStore};
 use tidalbar::models::{MediaItem, MediaKind, Shelf};
-use tidalbar::playback::{AudioEngine, MpvEngine};
+use tidalbar::playback::{AudioEngine, MpvEngine, PlaybackEvent};
 use tidalbar::tidal::TidalClient;
 use tidalbar::ui;
 
@@ -365,25 +365,36 @@ async fn run_app(
     terminal.draw(|frame| ui::draw(frame, app, artwork.as_deref_mut()))?;
 
     loop {
-        if !event::poll(Duration::from_millis(100))? {
+        let selected_before = artwork_target(app).map(|item| item.id.clone());
+        let playback_event = player.poll_event();
+        let playback_changed = playback_event.is_some();
+        match playback_event {
+            Some(PlaybackEvent::Finished) => {
+                if let Action::Play(item) = app.playback_finished() {
+                    play_track(&item, app, &mut player, tidal, playback).await;
+                }
+            }
+            Some(PlaybackEvent::Failed(message)) => {
+                app.now_playing = None;
+                app.paused = false;
+                app.playback_failed(message);
+            }
+            None => {}
+        }
+        let input_ready = event::poll(Duration::from_millis(100))?;
+        if !input_ready && !playback_changed {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-
-        let selected_before = app.selected().map(|item| item.id.clone());
-        match app.handle_key(key) {
-            Action::None => {}
-            Action::FocusPlayer(focused) => {
-                let target = if focused {
-                    app.now_playing.as_ref().or_else(|| app.selected())
-                } else {
-                    app.selected()
-                }
-                .cloned();
-                update_artwork(tidal, target.as_ref(), artwork.as_deref_mut()).await;
+        let action = if input_ready {
+            match event::read()? {
+                Event::Key(key) => app.handle_key(key),
+                _ => Action::None,
             }
+        } else {
+            Action::None
+        };
+        match action {
+            Action::None | Action::FocusPlayer(_) => {}
             Action::Quit => break,
             Action::Search(query) => {
                 if let Some(client) = tidal {
@@ -410,24 +421,7 @@ async fn run_app(
             }
             Action::Play(item) => match item.kind {
                 MediaKind::Track => {
-                    let resource = match (tidal, playback) {
-                        (Some(_), Some(playback)) => playback
-                            .unofficial_full_track(&item.id)
-                            .await
-                            .map_err(|error| error.to_string()),
-                        (None, _) => Err("Run `tidalbar auth login` for catalog access".to_owned()),
-                        (_, None) => {
-                            Err("Run `tidalbar auth login-playback` for full-track playback"
-                                .to_owned())
-                        }
-                    };
-                    match resource {
-                        Ok(resource) => match player.play(&resource) {
-                            Ok(()) => app.playback_started(item),
-                            Err(error) => app.playback_failed(error.to_string()),
-                        },
-                        Err(error) => app.playback_failed(error),
-                    }
+                    play_track(&item, app, &mut player, tidal, playback).await;
                 }
                 MediaKind::Album | MediaKind::Artist | MediaKind::Playlist => {
                     if let Some(client) = tidal {
@@ -457,9 +451,9 @@ async fn run_app(
             }
         }
 
-        let selected_after = app.selected().map(|item| item.id.clone());
+        let selected_after = artwork_target(app).map(|item| item.id.clone());
         if selected_after != selected_before {
-            update_artwork(tidal, app.selected(), artwork.as_deref_mut()).await;
+            update_artwork(tidal, artwork_target(app), artwork.as_deref_mut()).await;
         }
 
         terminal.draw(|frame| ui::draw(frame, app, artwork.as_deref_mut()))?;
@@ -469,6 +463,48 @@ async fn run_app(
         tracing::debug!(%error, "mpv was not running during shutdown");
     }
     Ok(())
+}
+
+fn artwork_target(app: &App) -> Option<&MediaItem> {
+    if app.player_focused {
+        app.now_playing.as_ref().or_else(|| app.selected())
+    } else {
+        app.selected()
+    }
+}
+
+async fn play_track(
+    item: &MediaItem,
+    app: &mut App,
+    player: &mut impl AudioEngine,
+    tidal: Option<&TidalClient>,
+    playback: Option<&TidalClient>,
+) {
+    let resource = match (tidal, playback) {
+        (Some(_), Some(playback)) => playback
+            .unofficial_full_track(&item.id)
+            .await
+            .map_err(|error| error.to_string()),
+        (None, _) => Err("Run `tidalbar auth login` for catalog access".to_owned()),
+        (_, None) => Err("Run `tidalbar auth login-playback` for full-track playback".to_owned()),
+    };
+    let result = match resource {
+        Ok(resource) => player.play(&resource).map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => app.playback_started(item.clone()),
+        Err(error) => playback_attempt_failed(app, player, error),
+    }
+}
+
+fn playback_attempt_failed(app: &mut App, player: &mut impl AudioEngine, message: String) {
+    // An earlier track's eventual EOF must not advance a newly failed queue.
+    // stop also cancels the engine's completion tracking before sending IPC.
+    let _ = player.stop();
+    app.now_playing = None;
+    app.paused = false;
+    app.playback_failed(message);
 }
 
 async fn load_screen(
@@ -572,5 +608,43 @@ async fn update_artwork(
     };
     if let Ok(bytes) = client.artwork(url).await {
         let _ = artwork.load(&bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tidalbar::playback::{PlayableResource, PlaybackError};
+
+    #[derive(Default)]
+    struct FakeEngine {
+        stops: usize,
+    }
+
+    impl AudioEngine for FakeEngine {
+        fn play(&mut self, _: &PlayableResource) -> Result<(), PlaybackError> {
+            panic!("no real playback expected");
+        }
+        fn set_paused(&mut self, _: bool) -> Result<(), PlaybackError> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<(), PlaybackError> {
+            self.stops += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_play_attempt_cancels_old_completion_without_network_or_mpv() {
+        let mut app = App::new(false);
+        let song = MediaItem::new("song", "Song", "Artist", MediaKind::Track);
+        app.playback_started(song.clone());
+        app.paused = true;
+        let mut player = FakeEngine::default();
+        play_track(&song, &mut app, &mut player, None, None).await;
+        assert_eq!(player.stops, 1);
+        assert!(app.now_playing.is_none());
+        assert!(!app.paused);
+        assert_eq!(app.status, "Run `tidalbar auth login` for catalog access");
     }
 }

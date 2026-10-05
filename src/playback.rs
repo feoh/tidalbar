@@ -1,5 +1,6 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -69,10 +70,19 @@ pub enum PlaybackError {
     Manifest(#[source] std::io::Error),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlaybackEvent {
+    Finished,
+    Failed(String),
+}
+
 pub trait AudioEngine {
     fn play(&mut self, resource: &PlayableResource) -> Result<(), PlaybackError>;
     fn set_paused(&mut self, paused: bool) -> Result<(), PlaybackError>;
     fn stop(&mut self) -> Result<(), PlaybackError>;
+    fn poll_event(&mut self) -> Option<PlaybackEvent> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -80,6 +90,9 @@ pub struct MpvEngine {
     child: Option<Child>,
     ipc: Option<Box<dyn Write + Send>>,
     ipc_path: Option<String>,
+    events: Option<Receiver<Value>>,
+    playback_events: PlaybackEvents,
+    next_request_id: u64,
     // Keep the current manifest until mpv has finished loading it. Keep the
     // previous one until a later play, since IPC writes do not await loadfile.
     current_manifest: Option<NamedTempFile>,
@@ -129,9 +142,10 @@ impl MpvEngine {
         );
         for _ in 0..100 {
             match connect_ipc(&ipc_path) {
-                Ok(ipc) => {
+                Ok((ipc, events)) => {
                     self.child = Some(child);
                     self.ipc = Some(ipc);
+                    self.events = Some(events);
                     self.ipc_path = Some(ipc_path);
                     return Ok(());
                 }
@@ -154,8 +168,19 @@ impl MpvEngine {
     }
 
     fn command(&mut self, command: Value) -> Result<(), PlaybackError> {
+        self.command_request(command, None)
+    }
+
+    fn command_request(
+        &mut self,
+        command: Value,
+        request_id: Option<u64>,
+    ) -> Result<(), PlaybackError> {
         self.ensure_started()?;
-        let mut payload = command_payload(command)?;
+        let mut payload = match request_id {
+            Some(id) => serde_json::to_vec(&json!({"command": command, "request_id": id}))?,
+            None => command_payload(command)?,
+        };
         payload.push(b'\n');
         let ipc = self.ipc.as_mut().ok_or_else(|| {
             PlaybackError::Command(std::io::Error::new(
@@ -170,6 +195,8 @@ impl MpvEngine {
 
     fn cleanup(&mut self) {
         self.ipc = None;
+        self.events = None;
+        self.playback_events = PlaybackEvents::default();
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
@@ -196,9 +223,20 @@ impl AudioEngine for MpvEngine {
             }
             _ => unreachable!("DASH manifest must have been staged"),
         };
-        self.command(json!(["loadfile", path, "replace"]))?;
+        self.ensure_started()?;
+        self.next_request_id += 2;
+        let request_id = self.next_request_id;
+        self.playback_events = PlaybackEvents::new(request_id);
+        self.command_request(json!(["loadfile", path, "replace"]), Some(request_id))?;
         self.previous_manifest = self.current_manifest.take();
         self.current_manifest = new_manifest;
+        // Older mpv versions do not return playlist_entry_id from loadfile.
+        // The ordered property reply identifies this load, not a replaced track.
+        self.command_request(
+            json!(["get_property", "playlist/0/id"]),
+            Some(request_id + 1),
+        )?;
+        self.set_paused(false)?;
         Ok(())
     }
 
@@ -206,7 +244,27 @@ impl AudioEngine for MpvEngine {
         self.command(json!(["set_property", "pause", paused]))
     }
 
+    fn poll_event(&mut self) -> Option<PlaybackEvent> {
+        let events = self.events.as_ref()?;
+        loop {
+            match events.try_recv() {
+                Ok(message) => {
+                    if let Some(event) = self.playback_events.accept(&message) {
+                        return Some(event);
+                    }
+                }
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    let event = self.playback_events.fail("mpv disconnected".to_owned());
+                    self.cleanup();
+                    return event;
+                }
+            }
+        }
+    }
+
     fn stop(&mut self) -> Result<(), PlaybackError> {
+        self.playback_events = PlaybackEvents::default();
         if self.child.is_none() {
             return Ok(());
         }
@@ -257,35 +315,118 @@ fn ipc_path() -> String {
     format!("tidalbar-mpv-{}", std::process::id())
 }
 
+type IpcConnection = (Box<dyn Write + Send>, Receiver<Value>);
+
 #[cfg(unix)]
-fn connect_ipc(path: &str) -> std::io::Result<Box<dyn Write + Send>> {
+fn connect_ipc(path: &str) -> std::io::Result<IpcConnection> {
     let stream = std::os::unix::net::UnixStream::connect(path)?;
-    drain_responses(stream.try_clone()?);
-    Ok(Box::new(stream))
+    let events = read_responses(stream.try_clone()?);
+    Ok((Box::new(stream), events))
 }
 
 #[cfg(windows)]
-fn connect_ipc(path: &str) -> std::io::Result<Box<dyn Write + Send>> {
+fn connect_ipc(path: &str) -> std::io::Result<IpcConnection> {
     let pipe = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)?;
-    drain_responses(pipe.try_clone()?);
-    Ok(Box::new(pipe))
+    let events = read_responses(pipe.try_clone()?);
+    Ok((Box::new(pipe), events))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn connect_ipc(_path: &str) -> std::io::Result<Box<dyn Write + Send>> {
+fn connect_ipc(_path: &str) -> std::io::Result<IpcConnection> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "mpv IPC is unsupported on this platform",
     ))
 }
 
-fn drain_responses(mut reader: impl Read + Send + 'static) {
+fn read_responses(reader: impl Read + Send + 'static) -> Receiver<Value> {
+    let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        for line in BufReader::new(reader).lines() {
+            let Ok(line) = line else { break };
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            // Ignore unrelated metadata and never log IPC payloads/stream URLs.
+            if (message.get("request_id").is_some() || message["event"] == "end-file")
+                && sender.send(message).is_err()
+            {
+                break;
+            }
+        }
     });
+    receiver
+}
+
+/// Correlate EOF with the current load. Replacement/stop events and replies from
+/// an earlier load must never advance the new queue.
+#[derive(Default)]
+struct PlaybackEvents {
+    request_id: Option<u64>,
+    entry_id: Option<i64>,
+    pending_ends: Vec<Value>,
+}
+
+impl PlaybackEvents {
+    fn new(request_id: u64) -> Self {
+        Self {
+            request_id: Some(request_id),
+            ..Self::default()
+        }
+    }
+
+    fn fail(&mut self, message: String) -> Option<PlaybackEvent> {
+        self.request_id.take()?;
+        self.pending_ends.clear();
+        Some(PlaybackEvent::Failed(message))
+    }
+
+    fn accept(&mut self, message: &Value) -> Option<PlaybackEvent> {
+        let request_id = self.request_id?;
+        if let Some(reply_id) = message["request_id"].as_u64() {
+            if reply_id == request_id || reply_id == request_id + 1 {
+                if message["error"].as_str() != Some("success") {
+                    return self.fail("mpv could not load the track".to_owned());
+                }
+                let entry = if reply_id == request_id {
+                    message["data"]["playlist_entry_id"].as_i64()
+                } else {
+                    message["data"].as_i64()
+                };
+                if let Some(entry) = entry {
+                    self.entry_id = Some(entry);
+                    let pending = std::mem::take(&mut self.pending_ends);
+                    for end in pending {
+                        if let Some(event) = self.accept(&end) {
+                            return Some(event);
+                        }
+                    }
+                }
+            }
+        } else if message["event"] == "end-file" {
+            let Some(entry) = self.entry_id else {
+                self.pending_ends.push(message.clone());
+                return None;
+            };
+            if message["playlist_entry_id"].as_i64() != Some(entry) {
+                return None;
+            }
+            match message["reason"].as_str() {
+                Some("eof") => {
+                    self.request_id = None;
+                    return Some(PlaybackEvent::Finished);
+                }
+                Some("error") => {
+                    return self.fail("mpv could not play the track · n skips it".to_owned());
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -348,6 +489,101 @@ mod tests {
         let path = file.path().to_owned();
         drop(file);
         assert!(!path.exists());
+    }
+
+    fn entry_reply(request_id: u64, entry: i64) -> Value {
+        json!({"request_id": request_id + 1, "error": "success", "data": entry})
+    }
+
+    fn end(entry: i64, reason: &str) -> Value {
+        json!({"event": "end-file", "playlist_entry_id": entry, "reason": reason})
+    }
+
+    #[test]
+    fn eof_advances_once_and_only_for_the_current_load() {
+        let mut events = PlaybackEvents::new(4);
+        assert_eq!(events.accept(&entry_reply(2, 10)), None);
+        assert_eq!(events.accept(&end(10, "eof")), None);
+        assert_eq!(events.accept(&entry_reply(4, 11)), None);
+        assert_eq!(events.accept(&end(10, "eof")), None);
+        assert_eq!(events.accept(&end(11, "stop")), None);
+        assert_eq!(
+            events.accept(&end(11, "eof")),
+            Some(PlaybackEvent::Finished)
+        );
+        assert_eq!(events.accept(&end(11, "eof")), None);
+    }
+
+    #[test]
+    fn short_tracks_can_end_before_the_property_reply() {
+        let mut events = PlaybackEvents::new(2);
+        events.accept(&end(8, "eof"));
+        assert_eq!(
+            events.accept(&entry_reply(2, 8)),
+            Some(PlaybackEvent::Finished)
+        );
+    }
+
+    #[test]
+    fn modern_loadfile_reply_identifies_the_track_before_the_probe_reply() {
+        let mut events = PlaybackEvents::new(2);
+        events.accept(
+            &json!({"request_id": 2, "error": "success", "data": {"playlist_entry_id": 8}}),
+        );
+        assert_eq!(events.accept(&end(8, "eof")), Some(PlaybackEvent::Finished));
+        assert_eq!(events.accept(&entry_reply(2, 8)), None);
+    }
+
+    #[test]
+    fn load_and_decoder_errors_do_not_advance_the_queue() {
+        let mut events = PlaybackEvents::new(2);
+        assert!(matches!(
+            events.accept(&json!({"request_id": 2, "error": "loading failed"})),
+            Some(PlaybackEvent::Failed(_))
+        ));
+        assert_eq!(events.accept(&end(8, "eof")), None);
+        let mut events = PlaybackEvents::new(4);
+        events.accept(&entry_reply(4, 9));
+        assert!(matches!(
+            events.accept(&end(9, "error")),
+            Some(PlaybackEvent::Failed(_))
+        ));
+        assert_eq!(events.accept(&end(9, "eof")), None);
+        let mut events = PlaybackEvents::new(6);
+        assert!(matches!(
+            events.fail("disconnected".to_owned()),
+            Some(PlaybackEvent::Failed(_))
+        ));
+        assert_eq!(events.fail("disconnected".to_owned()), None);
+    }
+
+    #[test]
+    fn disconnected_engine_can_be_restarted_and_reports_failure_once() {
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let mut engine = MpvEngine::new();
+        engine.events = Some(receiver);
+        engine.playback_events = PlaybackEvents::new(2);
+        assert_eq!(
+            engine.poll_event(),
+            Some(PlaybackEvent::Failed("mpv disconnected".to_owned()))
+        );
+        assert!(engine.events.is_none());
+        assert_eq!(engine.poll_event(), None);
+    }
+
+    #[test]
+    fn ipc_reader_filters_metadata_and_parses_newline_delimited_events() {
+        let input = std::io::Cursor::new(concat!(
+            "not json\n",
+            "{\"event\":\"file-loaded\"}\n",
+            "{\"request_id\":3,\"error\":\"success\",\"data\":7}\n",
+            "{\"event\":\"end-file\",\"playlist_entry_id\":7,\"reason\":\"eof\"}\n"
+        ));
+        let messages: Vec<_> = read_responses(input).iter().collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["request_id"], 3);
+        assert_eq!(messages[1], end(7, "eof"));
     }
 
     #[test]

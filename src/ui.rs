@@ -171,8 +171,18 @@ fn render_shelves(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(*row);
+        let shuffled = app.shuffle
+            && shelf
+                .items
+                .iter()
+                .any(|item| item.kind == crate::models::MediaKind::Track);
+        let title = if shuffled {
+            format!(" {} · shuffled song order", shelf.title)
+        } else {
+            format!(" {}", shelf.title)
+        };
         frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {}", shelf.title), title_style)),
+            Paragraph::new(Line::styled(title, title_style)),
             sections[0],
         );
 
@@ -250,7 +260,12 @@ fn render_player(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
         ]),
     ])
-    .block(Block::default().borders(Borders::TOP));
+    .block(
+        Block::default()
+            .title(format!(" s {} · n Next ", playback_order_label(app)))
+            .title_style(Style::default().fg(if app.shuffle { ACCENT } else { MUTED }))
+            .borders(Borders::TOP),
+    );
     frame.render_widget(player, area);
 }
 
@@ -278,7 +293,7 @@ fn render_player_focus(
         .constraints(if horizontal {
             [Constraint::Percentage(62), Constraint::Percentage(38)]
         } else {
-            [Constraint::Percentage(70), Constraint::Percentage(30)]
+            [Constraint::Min(3), Constraint::Length(18)]
         })
         .split(inner);
 
@@ -323,8 +338,13 @@ fn render_player_focus(
                 .add_modifier(Modifier::BOLD),
         ),
         Line::default(),
+        Line::styled(playback_order_label(app), Style::default().fg(ACCENT)),
         Line::styled(app.status.as_str(), Style::default().fg(MUTED)),
         Line::default(),
+        Line::styled(
+            "s  Toggle shuffle · n  Next",
+            Style::default().fg(Color::White),
+        ),
         Line::styled("Space  Pause / resume", Style::default().fg(Color::White)),
         Line::styled(
             "f / Esc  Return to browser",
@@ -346,6 +366,18 @@ fn render_player_focus(
             .border_style(Style::default().fg(PANEL)),
     );
     frame.render_widget(details, sections[1]);
+}
+
+fn playback_order_label(app: &App) -> String {
+    let mode = if app.shuffle {
+        "Shuffle: on"
+    } else {
+        "Shuffle: off"
+    };
+    match app.queue.progress() {
+        Some((position, total)) => format!("{mode} · Song {position}/{total}"),
+        None => mode.to_owned(),
+    }
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
@@ -381,6 +413,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Line::from("  Space             Pause or resume"),
+        Line::from("  s / S             Toggle displayed shuffle / reshuffle and play"),
+        Line::from("  n                 Next song in the captured list"),
         Line::default(),
         Line::from("  ? / Esc / q       Close this help     q  Quit elsewhere"),
     ])
@@ -513,6 +547,80 @@ mod tests {
         let text = rendered_text(terminal.backend().buffer());
         assert!(text.contains("PAUSED"));
         assert!(!text.contains("PREVIEW"));
+    }
+
+    #[test]
+    fn shuffle_status_is_visible_in_browser_and_player_focus() {
+        for width in [60, 100] {
+            let mut app = App::new(true);
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("test terminal");
+            terminal
+                .draw(|frame| draw(frame, &app, None))
+                .expect("draw");
+            assert!(rendered_text(terminal.backend().buffer()).contains("Shuffle: off"));
+            app.shuffle = true;
+            for focused in [false, true] {
+                app.player_focused = focused;
+                terminal
+                    .draw(|frame| draw(frame, &app, None))
+                    .expect("draw");
+                assert!(rendered_text(terminal.backend().buffer()).contains("Shuffle: on"));
+            }
+        }
+    }
+
+    #[test]
+    fn help_advertises_shuffle_and_next_song() {
+        let mut app = App::new(true);
+        app.help_visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, None))
+            .expect("draw");
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("Toggle displayed shuffle / reshuffle and play"));
+        assert!(text.contains("Next song in the captured list"));
+    }
+
+    #[test]
+    fn s_shows_the_shuffled_song_order_and_highlights_the_song_that_will_play() {
+        use crate::app::Action;
+        use crate::models::{MediaItem, MediaKind, Shelf};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(true);
+        app.replace_shelves(vec![Shelf::new(
+            "Playlist",
+            (0..6)
+                .map(|index| {
+                    MediaItem::new(
+                        index.to_string(),
+                        format!("Song {index}"),
+                        "Artist",
+                        MediaKind::Track,
+                    )
+                })
+                .collect(),
+        )]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, None))
+            .expect("draw");
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("shuffled song order"));
+        assert!(text.contains("Enter plays highlighted song"));
+        let positions: Vec<_> = app.shelves[0]
+            .items
+            .iter()
+            .map(|item| text.find(&item.title).expect("song rendered"))
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let selected = app.selected().unwrap().clone();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            Action::Play(selected)
+        );
     }
 
     #[test]
